@@ -1,8 +1,7 @@
 [package]
 name = "shared"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-postcard = "1.0"
+# Postcard/Serde removed as we are moving to raw byte streams for V2

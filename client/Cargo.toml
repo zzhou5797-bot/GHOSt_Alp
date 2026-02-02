@@ -1,11 +1,14 @@
 [package]
 name = "client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1.0"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+crossterm = "0.28"
+futures = "0.3"
 shared = { path = "../shared" }
-postcard = { version = "1.1.3", features = ["use-std"] }

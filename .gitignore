@@ -1,7 +1,10 @@
 /target
+**/target
+target_*
 *~
 *.DS_Store
 *.exe
 *.pdb
-target_fix/
-target_serial/
+*.log
+build*.log
+build*.txt
