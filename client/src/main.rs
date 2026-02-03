@@ -104,28 +104,42 @@ async fn run_client(args: Args) -> Result<()> {
         .await
         .context("Failed to connect")?;
 
-    eprintln!("Connected! Establishing stream...\r");
+    eprintln!("Connected! Handshaking...\r");
 
-    let (mut send, mut recv) = connection.open_bi().await?;
-
-    // Open Uni-directional Control Stream (Client -> Server)
+    // 1. Open Control Stream FIRST
     let mut control_tx = connection.open_uni().await?;
 
-    // Spawn Resize Monitor (Polling)
+    // 2. Perform Handshake
+    // A. Send TERM environment variable
+    let term = std::env::var("TERM").unwrap_or("xterm-256color".into());
+    let msg = shared::ControlMessage::SetEnv { key: "TERM".into(), value: term };
+    send_control_msg(&mut control_tx, &msg).await?;
+
+    // B. Send Initial Window Size
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let msg = shared::ControlMessage::Resize { rows, cols };
+    send_control_msg(&mut control_tx, &msg).await?;
+
+    // C. Finish Handshake
+    let msg = shared::ControlMessage::StartShell;
+    send_control_msg(&mut control_tx, &msg).await?;
+
+    eprintln!("Handshake complete. Stream established.\r");
+
+    // 3. Open Data Stream SECOND
+    let (mut send, mut recv) = connection.open_bi().await?;
+
+    // 4. Spawn Resize Monitor (Polling)
     // We poll window size to avoid conflicting with input stream reading in Raw Mode
     tokio::spawn(async move {
-        let mut last_cols = 0;
-        let mut last_rows = 0;
+        let mut last_cols = cols; // Use initial values
+        let mut last_rows = rows;
         loop {
              if let Ok((cols, rows)) = crossterm::terminal::size() {
                  if cols != last_cols || rows != last_rows {
                       let msg = shared::ControlMessage::Resize { rows, cols };
-                      if let Ok(json) = serde_json::to_vec(&msg) {
-                           let len = (json.len() as u32).to_be_bytes();
-                           // Ignore errors, if connection drops main loop will exit
-                           if control_tx.write_all(&len).await.is_err() { break; }
-                           if control_tx.write_all(&json).await.is_err() { break; }
-                      }
+                      // Ignore errors, if connection drops main loop will exit
+                      if send_control_msg(&mut control_tx, &msg).await.is_err() { break; }
                       last_cols = cols;
                       last_rows = rows;
                  }
@@ -134,7 +148,7 @@ async fn run_client(args: Args) -> Result<()> {
         }
     });
 
-    // Spawn Input Task (Stdin -> QUIC)
+    // 5. Spawn Input Task (Stdin -> QUIC)
     tokio::spawn(async move {
         // We need to read stdin specifically.
         // In Crossterm Raw Mode, Stdin is perfectly usable as raw bytes.
@@ -164,5 +178,13 @@ async fn run_client(args: Args) -> Result<()> {
         }
     }
     
+    Ok(())
+}
+
+async fn send_control_msg(tx: &mut quinn::SendStream, msg: &shared::ControlMessage) -> Result<()> {
+    let json = serde_json::to_vec(msg)?;
+    let len = (json.len() as u32).to_be_bytes();
+    tx.write_all(&len).await?;
+    tx.write_all(&json).await?;
     Ok(())
 }

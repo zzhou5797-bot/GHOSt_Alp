@@ -75,60 +75,60 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>)> {
     Ok((server_config, cert_der))
 }
 
-async fn handle_connection(connection: quinn::Connection) -> Result<()> {
-    // Accept the first bi-directional stream (Main Shell Stream)
-    let (mut send, mut recv) = connection.accept_bi().await?;
-    println!("Shell Data Stream established");
+mod session;
+mod protocol;
 
-    // Accept the first uni-directional stream (Control Stream)
-    let mut control_rx = connection.accept_uni().await?;
+async fn handle_connection(connection: quinn::Connection) -> Result<()> {
+    // 1. Accept Control Stream FIRST (Uni-directional)
+    let control_rx = connection.accept_uni().await?;
     println!("Control Stream established");
 
-    // Spawn PTY
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    // 2. Handshake Phase: Collect Configuration
+    let (handshake, mut control_rx) = protocol::perform_handshake(control_rx).await?;
+    println!("Handshake complete: {}x{}", handshake.pty_size.rows, handshake.pty_size.cols);
 
-    let cmd = CommandBuilder::new("sh"); // Or "bash" if preferred/available
-    let mut child = pair.slave.spawn_command(cmd)?;
+    // 3. Execution Phase: Spawn PTY with Config
+    let session = session::PtySession::new(handshake.pty_size, handshake.env_vars)?;
+    let mut child_guard = session.child;
     
-    // Drop slave to allow close propagation
-    drop(pair.slave);
+    // We separate the pair manually because we need ownership of master
+    let pair = session.pair;
+    drop(pair.slave); // Allow close propagation
 
     let mut master_reader = pair.master.try_clone_reader()?;
     let mut master_writer = pair.master.take_writer()?;
-    let mut pty_master = pair.master; // Move master for control usage
+    let mut pty_master = pair.master;
+
+    // 4. Accept Data Stream (Bi-directional)
+    // We expect the client to open this AFTER sending StartShell
+    let (mut send, mut recv) = connection.accept_bi().await?;
+    println!("Shell Data Stream established");
 
     // Use channels to bridge blocking PTY IO with async QUIC streams
     let (to_pty_tx, mut to_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let (from_pty_tx, mut from_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
 
-    // 1. Task: QUIC Stream Recv -> to_pty_tx
-    let _remote_read_task = tokio::spawn(async move {
+    // Task 1: QUIC Stream Recv -> to_pty_tx
+    tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
                     if to_pty_tx.send(buf[..n].to_vec()).await.is_err() { break; }
                 }
-                Ok(None) => break, // EOF
-                Err(_) => break,
+                _ => break,
             }
         }
     });
 
-    // 2. Thread: to_pty_rx -> PTY Writer
+    // Task 2: to_pty_rx -> PTY Writer (Blocking Thread)
     std::thread::spawn(move || {
         while let Some(data) = to_pty_rx.blocking_recv() {
             if master_writer.write_all(&data).is_err() { break; }
         }
     });
 
-    // 3. Thread: PTY Reader -> from_pty_tx
+    // Task 3: PTY Reader -> from_pty_tx (Blocking Thread)
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
@@ -141,71 +141,65 @@ async fn handle_connection(connection: quinn::Connection) -> Result<()> {
         }
     });
 
-    // 4. Task: from_pty_rx -> QUIC Stream Send
-    let _remote_write_task = tokio::spawn(async move {
+    // Task 4: from_pty_rx -> QUIC Stream Send
+    tokio::spawn(async move {
         while let Some(data) = from_pty_rx.recv().await {
             if send.write_all(&data).await.is_err() { break; }
         }
-        let _ = send.finish(); // No await needed in Quinn 0.11
+        let _ = send.finish();
     });
 
-    // 5. Task: Control Stream -> PTY Resize
-    // We assume messages are Length-Prefixed JSON: [u32 len][json body]
-    // WAIT: I cannot move pty_master to a channel message easily if it's not Clone.
-    // It is Send. So I can move it to a thread.
-    // Let's create a channel (ControlMessage -> PTY Thread)
+    // 5. Post-Handshake Control Stream Handling (Resize Monitor)
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<shared::ControlMessage>(16);
 
-    // 5a. Async Task: Read Control Stream -> Channel
+    // Async Task: Continue reading Control Stream
     tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
-            // Read Length
+             // We can't use `read_exact` easily with potential EOF, but let's try
             match control_rx.read_exact(&mut len_buf).await {
                 Ok(_) => {
                     let len = u32::from_be_bytes(len_buf) as usize;
                     let mut body = vec![0u8; len];
-                    match control_rx.read_exact(&mut body).await {
-                        Ok(_) => {
-                            if let Ok(msg) = serde_json::from_slice::<shared::ControlMessage>(&body) {
-                                if ctrl_tx.send(msg).await.is_err() { break; }
-                            }
+                    if control_rx.read_exact(&mut body).await.is_ok() {
+                        if let Ok(msg) = serde_json::from_slice::<shared::ControlMessage>(&body) {
+                             if ctrl_tx.send(msg).await.is_err() { break; }
                         }
-                        Err(_) => break,
-                    }
+                    } else { break; }
                 }
-                Err(_) => break,
+                Err(_) => break, // Connection closed
             }
         }
     });
 
-    // 5b. Blocking Task: Channel -> PTY Master Resize
+    // Blocking Task: PTY Master Resize
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = ctrl_rx.blocking_recv() {
-            match msg {
+             match msg {
                 shared::ControlMessage::Resize { rows, cols } => {
-                     println!("Resizing PTY to {}x{}", rows, cols);
-                     let _ = pty_master.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                     });
+                    let _ = pty_master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                 }
                 _ => {}
             }
         }
     });
 
-    // Wait for shell to exit
-    // child.wait()?; // This blocks.
-    
-    // We can run a supervision loop
+    // 6. Supervision Loop (Event Driven)
     loop {
-        if let Ok(Some(_status)) = child.try_wait() {
-             break;
+        tokio::select! {
+            // A. Connection lost
+            _ = connection.closed() => {
+                println!("Supervision: Connection closed by remote. Exiting.");
+                break;
+            }
+            // B. Shell exited
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                 if let Ok(Some(status)) = child_guard.0.try_wait() {
+                     println!("Supervision: Shell exited with status: {:?}", status);
+                     break;
+                 }
+            }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
     
     Ok(())
