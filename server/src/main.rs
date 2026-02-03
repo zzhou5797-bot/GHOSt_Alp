@@ -78,7 +78,11 @@ fn configure_server() -> Result<(ServerConfig, Vec<u8>)> {
 async fn handle_connection(connection: quinn::Connection) -> Result<()> {
     // Accept the first bi-directional stream (Main Shell Stream)
     let (mut send, mut recv) = connection.accept_bi().await?;
-    println!("Stream established");
+    println!("Shell Data Stream established");
+
+    // Accept the first uni-directional stream (Control Stream)
+    let mut control_rx = connection.accept_uni().await?;
+    println!("Control Stream established");
 
     // Spawn PTY
     let pty_system = NativePtySystem::default();
@@ -97,6 +101,7 @@ async fn handle_connection(connection: quinn::Connection) -> Result<()> {
 
     let mut master_reader = pair.master.try_clone_reader()?;
     let mut master_writer = pair.master.take_writer()?;
+    let mut pty_master = pair.master; // Move master for control usage
 
     // Use channels to bridge blocking PTY IO with async QUIC streams
     let (to_pty_tx, mut to_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
@@ -142,6 +147,54 @@ async fn handle_connection(connection: quinn::Connection) -> Result<()> {
             if send.write_all(&data).await.is_err() { break; }
         }
         let _ = send.finish(); // No await needed in Quinn 0.11
+    });
+
+    // 5. Task: Control Stream -> PTY Resize
+    // We assume messages are Length-Prefixed JSON: [u32 len][json body]
+    // WAIT: I cannot move pty_master to a channel message easily if it's not Clone.
+    // It is Send. So I can move it to a thread.
+    // Let's create a channel (ControlMessage -> PTY Thread)
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<shared::ControlMessage>(16);
+
+    // 5a. Async Task: Read Control Stream -> Channel
+    tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            // Read Length
+            match control_rx.read_exact(&mut len_buf).await {
+                Ok(_) => {
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    let mut body = vec![0u8; len];
+                    match control_rx.read_exact(&mut body).await {
+                        Ok(_) => {
+                            if let Ok(msg) = serde_json::from_slice::<shared::ControlMessage>(&body) {
+                                if ctrl_tx.send(msg).await.is_err() { break; }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 5b. Blocking Task: Channel -> PTY Master Resize
+    tokio::task::spawn_blocking(move || {
+        while let Some(msg) = ctrl_rx.blocking_recv() {
+            match msg {
+                shared::ControlMessage::Resize { rows, cols } => {
+                     println!("Resizing PTY to {}x{}", rows, cols);
+                     let _ = pty_master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                     });
+                }
+                _ => {}
+            }
+        }
     });
 
     // Wait for shell to exit

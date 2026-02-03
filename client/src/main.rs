@@ -108,6 +108,32 @@ async fn run_client(args: Args) -> Result<()> {
 
     let (mut send, mut recv) = connection.open_bi().await?;
 
+    // Open Uni-directional Control Stream (Client -> Server)
+    let mut control_tx = connection.open_uni().await?;
+
+    // Spawn Resize Monitor (Polling)
+    // We poll window size to avoid conflicting with input stream reading in Raw Mode
+    tokio::spawn(async move {
+        let mut last_cols = 0;
+        let mut last_rows = 0;
+        loop {
+             if let Ok((cols, rows)) = crossterm::terminal::size() {
+                 if cols != last_cols || rows != last_rows {
+                      let msg = shared::ControlMessage::Resize { rows, cols };
+                      if let Ok(json) = serde_json::to_vec(&msg) {
+                           let len = (json.len() as u32).to_be_bytes();
+                           // Ignore errors, if connection drops main loop will exit
+                           if control_tx.write_all(&len).await.is_err() { break; }
+                           if control_tx.write_all(&json).await.is_err() { break; }
+                      }
+                      last_cols = cols;
+                      last_rows = rows;
+                 }
+             }
+             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    });
+
     // Spawn Input Task (Stdin -> QUIC)
     tokio::spawn(async move {
         // We need to read stdin specifically.
