@@ -2,15 +2,14 @@
 #![no_main]
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerfEventArray};
+use aya_ebpf::maps::{HashMap, PerfEventArray};
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
     macros::{tracepoint, xdp},
     programs::{TracePointContext, XdpContext},
 };
-use core::mem;
-use gateway_ebpf_common::{AuditEvent, SpaPayload};
+use gateway_ebpf_common::{AuditEvent, AuthState, SpaPayload};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -18,13 +17,10 @@ use network_types::{
 };
 
 #[map]
-static TIME_DELTA_MAP: Array<u64> = Array::with_max_entries(1, 0);
+static AUTH_STATE_MAP: HashMap<u32, AuthState> = HashMap::with_max_entries(1024, 0);
 
 #[map]
-static REPLAY_FILTER_MAP: LruHashMap<[u8; 8], u64> = LruHashMap::with_max_entries(1024, 0);
-
-#[map]
-static ALLOW_LIST_MAP: HashMap<u32, u64> = HashMap::with_max_entries(1024, 0);
+static ALLOW_LIST_MAP: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 
 #[map]
 static AUDIT_EVENTS: PerfEventArray<AuditEvent> = PerfEventArray::new(0);
@@ -100,7 +96,7 @@ pub fn siphash24_16b(k0: u64, k1: u64, m0: u64, m1: u64) -> [u8; 8] {
 unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
-    let len = mem::size_of::<T>();
+    let len = core::mem::size_of::<T>();
 
     if start + offset + len > end {
         return Err(());
@@ -146,13 +142,12 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    let bpf_time = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
-
     // Check if IP is currently authorized (QUIC traffic)
-    if let Some(expiry) = unsafe { ALLOW_LIST_MAP.get(&ipv4_source) } {
-        if bpf_time < *expiry {
-            // Already authorized, pass the packet up the network stack
-            return Ok(xdp_action::XDP_PASS);
+    if let Some(user_id) = unsafe { ALLOW_LIST_MAP.get(&ipv4_source) } {
+        if let Some(auth_state) = unsafe { AUTH_STATE_MAP.get(user_id) } {
+            if auth_state.tokens > 0 {
+                return Ok(xdp_action::XDP_PASS);
+            }
         }
     }
 
@@ -181,87 +176,72 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    let version =
+    let _version =
         u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).version)) });
-    let timestamp_ns = u64::from_be(unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*payload).timestamp_ns))
-    });
+    let subject =
+        u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).subject)) });
+    let seq =
+        u64::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).seq)) });
+    let packet_hash = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).hash)) };
 
-    // info!(&ctx, "SPA Knock from IPv4 {}, Version: {}, Time: {}", ipv4_source, version, timestamp_ns);
-
-    // 6. Time Delta Verification
-    // Retrieve the Time Delta (Host Boot Time difference)
-    let time_delta = TIME_DELTA_MAP.get(0);
-    let host_time_ns = match time_delta {
-        Some(dt) => match unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() }.checked_add(*dt) {
-            Some(t) => t,
-            None => {
-                // info!(&ctx, "XDP_DROP: Time Delta overflow");
-                return Ok(xdp_action::XDP_DROP);
-            }
-        },
-        None => {
-            // info!(&ctx, "XDP_DROP: Time Delta Map not initialized");
-            return Ok(xdp_action::XDP_DROP);
-        }
+    // 6. Look up User Auth State
+    let auth_state_ptr = match unsafe { AUTH_STATE_MAP.get_ptr_mut(&subject) } {
+        Some(ptr) => ptr,
+        None => return Ok(xdp_action::XDP_DROP), // Unknown user/DID subject
     };
 
-    // Tolerate +/- 5 seconds of clock skew/latency (5_000_000_000 ns)
-    let skew: u64 = 5_000_000_000;
+    let mut auth_state = unsafe { core::ptr::read_volatile(auth_state_ptr) };
 
-    // Careful with subtraction overflow if timestamp_ns is smaller than host_time_ns
-    let diff = if timestamp_ns > host_time_ns {
-        timestamp_ns - host_time_ns
-    } else {
-        host_time_ns - timestamp_ns
-    };
-
-    if diff > skew {
-        // info!(&ctx, "XDP_DROP: Timestamp out of valid window (skew: {} ns)", diff);
-        return Ok(xdp_action::XDP_DROP);
+    // 7. Hash Chain Sequence Validation
+    if seq >= auth_state.expected_seq {
+        return Ok(xdp_action::XDP_DROP); // Replay attack or old packet (seq must be strictly descending)
     }
 
-    // 7. SipHash-2-4 Signature Verification
+    let delta = auth_state.expected_seq - seq;
+    if delta > 10 {
+        return Ok(xdp_action::XDP_DROP); // Exceeds lookahead window max (10 drops max)
+    }
+
+    // 8. O(1) Bounded Hash Verification Loop (#pragma unroll equivalent)
     let secret_k0: u64 = 0x04030201efbeadde;
     let secret_k1: u64 = 0x0d0c0b0affe0dcba;
 
-    // Message (m0, m1) consists of Magic + Version and Timestamp
-    let m0 = ((magic as u64) << 32) | (version as u64);
-    let m1 = timestamp_ns;
+    let mut current_hash = packet_hash;
 
-    let computed_sig = siphash24_16b(secret_k0, secret_k1, m0, m1);
-    let packet_sig =
-        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).signature)) };
-
-    // Constant-time-like comparison for 8 bytes (since it's SipHash-2-4)
-    let mut sig_match = true;
-    for i in 0..8 {
-        if computed_sig[i] != packet_sig[i] {
-            sig_match = false;
+    for i in 0..10 {
+        if (i as u64) < delta {
+            let mut m0_bytes = [0u8; 8];
+            m0_bytes.copy_from_slice(&current_hash);
+            let m0 = u64::from_le_bytes(m0_bytes);
+            let m1 = 0; // padding for 16b SipHash
+            current_hash = siphash24_16b(secret_k0, secret_k1, m0, m1);
         }
     }
 
-    if !sig_match {
-        // info!(&ctx, "XDP_DROP: SipHash Signature mismatch");
-        return Ok(xdp_action::XDP_DROP);
+    let mut match_ok = true;
+    for i in 0..8 {
+        if current_hash[i] != auth_state.anchor_hash[i] {
+            match_ok = false;
+        }
     }
 
-    // 8. Replay Filter Check
-    // Create an 8 byte array representation from siphash output for key
-    if unsafe { REPLAY_FILTER_MAP.get(&computed_sig).is_some() } {
-        // info!(&ctx, "XDP_DROP: Replay Attack Detected (Signature already seen)");
-        return Ok(xdp_action::XDP_DROP);
+    if !match_ok {
+        return Ok(xdp_action::XDP_DROP); // Invalid Hash Preimage
     }
 
-    // Mark Signature as seen (value is just current time)
-    let _ = REPLAY_FILTER_MAP.insert(&computed_sig, &host_time_ns, 0);
+    // 9. State Fast-Forward & IP Binding
+    auth_state.expected_seq = seq;
+    auth_state.anchor_hash = packet_hash;
+    // Set 1 initial token to allow QUIC connection to start. Quota actual value can be managed by userspace.
+    auth_state.tokens = 1;
 
-    // 9. Allow List Insertion
-    // Open a 3-second window for this IP to establish QUIC connection (using monotonic time)
-    let expiry_time = bpf_time + 3_000_000_000;
-    let _ = ALLOW_LIST_MAP.insert(&ipv4_source, &expiry_time, 0);
+    // Atomically write back state
+    unsafe { core::ptr::write_volatile(auth_state_ptr, auth_state) };
 
-    Ok(xdp_action::XDP_DROP) // Still drop the knock packet itself silently
+    // Bind this IP to the subject
+    let _ = ALLOW_LIST_MAP.insert(&ipv4_source, &subject, 0);
+
+    Ok(xdp_action::XDP_DROP) // Drop the knock packet itself silently
 }
 
 // Tracepoint hook: fires on every execve(2) syscall entry in the kernel
