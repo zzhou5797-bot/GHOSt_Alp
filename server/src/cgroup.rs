@@ -55,6 +55,26 @@ impl SessionCgroup {
         Ok(Self { path, id })
     }
 
+    /// Create an empty cgroup directory for a session without joining any processes
+    pub fn create_empty(session_id: &str) -> Result<Self> {
+        let path = PathBuf::from(CGROUP_BASE).join(session_id);
+
+        // Ensure the base directory exists
+        fs::create_dir_all(&path)
+            .with_context(|| format!("Failed to create cgroup dir: {}", path.display()))?;
+
+        // Read back the numeric cgroup ID assigned by the kernel
+        let id = Self::read_cgroup_id(&path)?;
+
+        tracing::info!(
+            "[CGROUP] Created empty Session '{}' → cgroup_id={}",
+            session_id,
+            id
+        );
+
+        Ok(Self { path, id })
+    }
+
     /// Read the numeric cgroup ID from `/sys/fs/cgroup/.../cgroup.id` using
     /// the `ino` of the directory (kernels < 5.7) or the `cgroup.id` file.
     fn read_cgroup_id(path: &Path) -> Result<u64> {

@@ -46,6 +46,17 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Ok(cgroup_procs) = std::env::var("INTERNAL_CGROUP_JOIN") {
+        if cgroup_procs != "SKIP" {
+            let pid = std::process::id();
+            let _ = fs::write(&cgroup_procs, format!("{}\n", pid));
+        }
+        let mut cmd = std::process::Command::new("sh");
+        let err = std::os::unix::process::CommandExt::exec(&mut cmd);
+        eprintln!("Failed to exec shell: {}", err);
+        std::process::exit(1);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
@@ -164,23 +175,25 @@ async fn main() -> Result<()> {
             tracing::info!("Health probe listening on {}", health_addr);
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    let mut buf = [0; 128];
-                    // Very simple HTTP check: Read the first few bytes and see if it looks like a GET request
-                    if let Ok(Ok(n)) = tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        stream.read(&mut buf),
-                    )
-                    .await
-                    {
-                        if n >= 4 && &buf[0..4] == b"GET " {
-                            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                            let _ = stream.write_all(response).await;
-                        } else {
-                            // If it's not a GET request, just close it or send 400 Bad Request
-                            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request";
-                            let _ = stream.write_all(response).await;
+                    tokio::spawn(async move {
+                        let mut buf = [0; 128];
+                        // Very simple HTTP check: Read the first few bytes and see if it looks like a GET request
+                        if let Ok(Ok(n)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            stream.read(&mut buf),
+                        )
+                        .await
+                        {
+                            if n >= 4 && &buf[0..4] == b"GET " {
+                                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                                let _ = stream.write_all(response).await;
+                            } else {
+                                // If it's not a GET request, just close it or send 400 Bad Request
+                                let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request";
+                                let _ = stream.write_all(response).await;
+                            }
                         }
-                    }
+                    });
                 }
             }
         } else {
@@ -190,15 +203,23 @@ async fn main() -> Result<()> {
 
     // Set up a channel so session handlers can signal new cgroup IDs to be registered
     // in the AUDIT_CGROUP_MAP eBPF map. audit_cgroup_map is moved into this task.
-    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<u64>(64);
+    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, bool)>(64);
     tokio::spawn(async move {
         let mut cgroup_map = audit_cgroup_map;
-        while let Some(cgroup_id) = cgroup_rx.recv().await {
-            let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
-            tracing::info!(
-                "[AUDIT] Registered cgroup_id={} in AUDIT_CGROUP_MAP",
-                cgroup_id
-            );
+        while let Some((cgroup_id, add)) = cgroup_rx.recv().await {
+            if add {
+                let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
+                tracing::info!(
+                    "[AUDIT] Registered cgroup_id={} in AUDIT_CGROUP_MAP",
+                    cgroup_id
+                );
+            } else {
+                let _ = cgroup_map.remove(&cgroup_id);
+                tracing::info!(
+                    "[AUDIT] Removed cgroup_id={} from AUDIT_CGROUP_MAP",
+                    cgroup_id
+                );
+            }
         }
     });
 
@@ -302,7 +323,7 @@ fn configure_server(
 async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<u64>,
+    cgroup_tx: tokio::sync::mpsc::Sender<(u64, bool)>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -317,26 +338,32 @@ async fn handle_connection(
         handshake.pty_size.cols
     );
 
-    // 3. Execution Phase: Spawn PTY with Config
-    let session = session::PtySession::new(handshake.pty_size, handshake.env_vars)?;
-    let child_pid = session.child_pid;
-    let mut child_guard = session.child;
-
-    // 4a. Place the child process in a dedicated cgroupv2 for kernel-level audit
-    let session_id = format!("session_{}", child_pid);
-    let _session_cgroup = match cgroup::SessionCgroup::create(&session_id, child_pid) {
+    // 3. Prepare empty Session Cgroup FIRST
+    static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let session_idx = SESSION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let session_id = format!("session_{}", session_idx);
+    let _session_cgroup = match cgroup::SessionCgroup::create_empty(&session_id) {
         Ok(cg) => {
-            // Send cgroup_id to the main task, which will insert it into AUDIT_CGROUP_MAP
-            cgroup_tx.send(cg.id).await.ok();
+            // Send cgroup_id to the main task to insert into AUDIT_CGROUP_MAP
+            cgroup_tx.send((cg.id, true)).await.ok();
             tracing::info!("[AUDIT] Activated kernel probe for cgroup_id={}", cg.id);
             Some(cg)
         }
         Err(e) => {
-            // Non-fatal: audit unavailable (e.g. running without root / cgroup support)
             tracing::warn!("[AUDIT] Could not create session cgroup: {:#}", e);
             None
         }
     };
+
+    let cgroup_procs_path = _session_cgroup
+        .as_ref()
+        .map(|cg| cg.path.join("cgroup.procs"));
+
+    // 4. Execution Phase: Spawn PTY with Config and Cgroup Hook
+    let session =
+        session::PtySession::new(handshake.pty_size, handshake.env_vars, cgroup_procs_path)?;
+    let child_pid = session.child_pid;
+    let mut child_guard = session.child;
 
     // We separate the pair manually because we need ownership of master
     let pair = session.pair;
@@ -414,6 +441,12 @@ async fn handle_connection(
             match control_rx.read_exact(&mut len_buf).await {
                 Ok(_) => {
                     let len = u32::from_be_bytes(len_buf) as usize;
+                    // Fix 1: Bound memory allocation to prevent OOM crash
+                    if len > 65536 {
+                        tracing::error!("Control message too large: {} bytes", len);
+                        break;
+                    }
+
                     let mut body = vec![0u8; len];
                     if control_rx.read_exact(&mut body).await.is_ok() {
                         if let Ok(msg) = serde_json::from_slice::<shared::ControlMessage>(&body) {
@@ -463,6 +496,11 @@ async fn handle_connection(
                  }
             }
         }
+    }
+
+    if let Some(cg) = _session_cgroup {
+        tracing::info!("[AUDIT] Deactivating kernel probe for cgroup_id={}", cg.id);
+        let _ = cgroup_tx.send((cg.id, false)).await;
     }
 
     Ok(())

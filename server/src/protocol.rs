@@ -28,6 +28,12 @@ pub async fn perform_handshake(
         match control_rx.read_exact(&mut len_buf).await {
             Ok(_) => {
                 let len = u32::from_be_bytes(len_buf) as usize;
+                // Fix 1: Bound memory allocation to prevent OOM crash
+                if len > 65536 {
+                    tracing::error!("Control message too large: {} bytes", len);
+                    return Err(anyhow::anyhow!("Control message too large"));
+                }
+
                 let mut body = vec![0u8; len];
                 control_rx.read_exact(&mut body).await?;
 

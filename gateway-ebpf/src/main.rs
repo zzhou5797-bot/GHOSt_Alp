@@ -151,6 +151,10 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     // Check if IP is currently authorized (QUIC traffic)
     if let Some(expiry) = unsafe { ALLOW_LIST_MAP.get(&ipv4_source) } {
         if bpf_time < *expiry {
+            // Fix 3: Refresh the TTL in ALLOW_LIST_MAP to prevent XDP "suicide" drop for continuous streams
+            let new_expiry = bpf_time + 3_000_000_000; // Extend by 3 seconds
+            let _ = unsafe { ALLOW_LIST_MAP.insert(&ipv4_source, &new_expiry, 0) };
+
             // Already authorized, pass the packet up the network stack
             return Ok(xdp_action::XDP_PASS);
         }
