@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tailscale-gateway
+  annotations:
+    service.beta.kubernetes.io/alicloud-loadbalancer-udp-timeout: "300"
+    service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout: "300"
+spec:
+  type: LoadBalancer
+  selector:
+    app: tailscale-gateway
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: UDP
+    name: quic

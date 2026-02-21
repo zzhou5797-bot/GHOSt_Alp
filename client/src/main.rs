@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::{
-    terminal::{disable_raw_mode, enable_raw_mode},
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use quinn::{ClientConfig, Endpoint, TransportConfig};
-use std::{net::SocketAddr, sync::Arc};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser, Debug)]
@@ -12,56 +10,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Args {
     #[arg(short, long, default_value = "127.0.0.1")]
     host: String,
+
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
-}
 
-#[derive(Debug)]
-struct SkipServerVerification;
+    #[arg(long, default_value = "../certs/ca.crt")]
+    ca: PathBuf,
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
+    #[arg(long, default_value = "../certs/client.crt")]
+    cert: PathBuf,
 
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
+    #[arg(long, default_value = "../certs/client.key")]
+    key: PathBuf,
 
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
+    #[arg(long, env = "GATEWAY_TOKEN", default_value = "secret-token")]
+    token: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
     // Enable Raw Mode immediately for TTY feel
     enable_raw_mode()?;
 
@@ -76,16 +45,40 @@ async fn main() -> Result<()> {
 }
 
 async fn run_client(args: Args) -> Result<()> {
-    // UNSAFE: Skip verification for V2 MVP
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
-    
-    let mut crypto = crypto;
+    // 1. Load CA cert
+    let ca_cert_pem =
+        fs::read(&args.ca).with_context(|| format!("Failed to read CA cert from {:?}", args.ca))?;
+    let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca_cert_reader).collect::<Result<_, _>>()?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        roots.add(cert)?;
+    }
+
+    // 2. Load Client cert
+    let cert_pem = fs::read(&args.cert)
+        .with_context(|| format!("Failed to read client cert from {:?}", args.cert))?;
+    let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+    // 3. Load Client key
+    let key_pem = fs::read(&args.key)
+        .with_context(|| format!("Failed to read client key from {:?}", args.key))?;
+    let mut key_reader = std::io::BufReader::new(key_pem.as_slice());
+    let priv_key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+
+    // 4. Configure TLS
+    let mut crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(cert_chain, priv_key)?;
+
     crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
-    let mut client_config = ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?));
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
     let mut transport = TransportConfig::default();
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     client_config.transport_config(Arc::new(transport));
@@ -98,7 +91,7 @@ async fn run_client(args: Args) -> Result<()> {
         .context("Invalid address")?;
 
     eprintln!("Connecting to {}...\r", remote_addr);
-    
+
     let connection = endpoint
         .connect(remote_addr, "localhost")?
         .await
@@ -110,17 +103,24 @@ async fn run_client(args: Args) -> Result<()> {
     let mut control_tx = connection.open_uni().await?;
 
     // 2. Perform Handshake
-    // A. Send TERM environment variable
-    let term = std::env::var("TERM").unwrap_or("xterm-256color".into());
-    let msg = shared::ControlMessage::SetEnv { key: "TERM".into(), value: term };
+    // A. Send Authenticate Token FIRST
+    let msg = shared::ControlMessage::Authenticate { token: args.token };
     send_control_msg(&mut control_tx, &msg).await?;
 
-    // B. Send Initial Window Size
+    // B. Send TERM environment variable
+    let term = std::env::var("TERM").unwrap_or("xterm-256color".into());
+    let msg = shared::ControlMessage::SetEnv {
+        key: "TERM".into(),
+        value: term,
+    };
+    send_control_msg(&mut control_tx, &msg).await?;
+
+    // C. Send Initial Window Size
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let msg = shared::ControlMessage::Resize { rows, cols };
     send_control_msg(&mut control_tx, &msg).await?;
 
-    // C. Finish Handshake
+    // D. Finish Handshake
     let msg = shared::ControlMessage::StartShell;
     send_control_msg(&mut control_tx, &msg).await?;
 
@@ -135,16 +135,18 @@ async fn run_client(args: Args) -> Result<()> {
         let mut last_cols = cols; // Use initial values
         let mut last_rows = rows;
         loop {
-             if let Ok((cols, rows)) = crossterm::terminal::size() {
-                 if cols != last_cols || rows != last_rows {
-                      let msg = shared::ControlMessage::Resize { rows, cols };
-                      // Ignore errors, if connection drops main loop will exit
-                      if send_control_msg(&mut control_tx, &msg).await.is_err() { break; }
-                      last_cols = cols;
-                      last_rows = rows;
-                 }
-             }
-             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            if let Ok((cols, rows)) = crossterm::terminal::size() {
+                if cols != last_cols || rows != last_rows {
+                    let msg = shared::ControlMessage::Resize { rows, cols };
+                    // Ignore errors, if connection drops main loop will exit
+                    if send_control_msg(&mut control_tx, &msg).await.is_err() {
+                        break;
+                    }
+                    last_cols = cols;
+                    last_rows = rows;
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
     });
 
@@ -157,7 +159,9 @@ async fn run_client(args: Args) -> Result<()> {
         loop {
             match stdin.read(&mut buf).await {
                 Ok(n) if n > 0 => {
-                    if send.write_all(&buf[..n]).await.is_err() { break; }
+                    if send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
                 }
                 _ => break,
             }
@@ -174,10 +178,10 @@ async fn run_client(args: Args) -> Result<()> {
                 stdout.flush().await?;
             }
             Ok(None) => break, // EOF
-            Err(_) => break, // Connection lost
+            Err(_) => break,   // Connection lost
         }
     }
-    
+
     Ok(())
 }
 
