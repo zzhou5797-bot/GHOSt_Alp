@@ -1,6 +1,10 @@
+mod cgroup;
+mod protocol;
+mod session;
+
 use anyhow::{Context, Result};
 use aya::{
-    maps::{Array, AsyncPerfEventArray},
+    maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap},
     programs::{TracePoint, Xdp, XdpFlags},
     Ebpf,
 };
@@ -96,9 +100,16 @@ async fn main() -> Result<()> {
     // Leak bpf to make it 'static — it must live for the duration of the process
     let bpf: &'static mut Ebpf = Box::leak(Box::new(bpf));
 
+    // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
+    // cgroup registration task independently.
+    let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
+        bpf.take_map("AUDIT_CGROUP_MAP")
+            .ok_or_else(|| anyhow::anyhow!("AUDIT_CGROUP_MAP not found"))?,
+    )?;
+
     // Consume AuditEvents: spawn one async task per online CPU via AsyncPerfEventArray
     let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(
-        bpf.map_mut("AUDIT_EVENTS")
+        bpf.take_map("AUDIT_EVENTS")
             .ok_or_else(|| anyhow::anyhow!("AUDIT_EVENTS map not found"))?,
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
@@ -123,11 +134,11 @@ async fn main() -> Result<()> {
                         let args_len = (event.args_len as usize).min(256);
                         let args = bytes_to_str(&event.args[..args_len]);
                         tracing::info!(
-                            "[AUDIT] cgroup={} uid={} pid={} ppid={} exec=\"{}\" argv0=\"{}\"",
+                            "[AUDIT] cgroup={} uid={} pid={} tid={} exec=\"{}\" argv0=\"{}\"",
                             event.cgroup_id,
                             event.uid,
                             event.pid,
-                            event.ppid,
+                            event.tid,
                             filename,
                             args
                         );
@@ -168,8 +179,23 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Set up a channel so session handlers can signal new cgroup IDs to be registered
+    // in the AUDIT_CGROUP_MAP eBPF map. audit_cgroup_map is moved into this task.
+    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<u64>(64);
+    tokio::spawn(async move {
+        let mut cgroup_map = audit_cgroup_map;
+        while let Some(cgroup_id) = cgroup_rx.recv().await {
+            let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
+            tracing::info!(
+                "[AUDIT] Registered cgroup_id={} in AUDIT_CGROUP_MAP",
+                cgroup_id
+            );
+        }
+    });
+
     while let Some(conn) = endpoint.accept().await {
         let token_clone = Arc::clone(&token);
+        let cgroup_tx_clone = cgroup_tx.clone();
         tokio::spawn(async move {
             let remote = conn.remote_address();
             tracing::info!("Connection initialized from {}", remote);
@@ -197,7 +223,7 @@ async fn main() -> Result<()> {
                 tracing::warn!("Client connected without identity (should be rejected by rustls)");
             }
 
-            if let Err(e) = handle_connection(connection, &token_clone).await {
+            if let Err(e) = handle_connection(connection, &token_clone, cgroup_tx_clone).await {
                 tracing::error!("Connection error with {}: {:?}", remote, e);
             }
         });
@@ -264,10 +290,11 @@ fn configure_server(
     Ok(server_config)
 }
 
-mod protocol;
-mod session;
-
-async fn handle_connection(connection: quinn::Connection, expected_token: &str) -> Result<()> {
+async fn handle_connection(
+    connection: quinn::Connection,
+    expected_token: &str,
+    cgroup_tx: tokio::sync::mpsc::Sender<u64>,
+) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
     tracing::info!("Control Stream established");
@@ -283,7 +310,24 @@ async fn handle_connection(connection: quinn::Connection, expected_token: &str) 
 
     // 3. Execution Phase: Spawn PTY with Config
     let session = session::PtySession::new(handshake.pty_size, handshake.env_vars)?;
+    let child_pid = session.child_pid;
     let mut child_guard = session.child;
+
+    // 4a. Place the child process in a dedicated cgroupv2 for kernel-level audit
+    let session_id = format!("session_{}", child_pid);
+    let _session_cgroup = match cgroup::SessionCgroup::create(&session_id, child_pid) {
+        Ok(cg) => {
+            // Send cgroup_id to the main task, which will insert it into AUDIT_CGROUP_MAP
+            cgroup_tx.send(cg.id).await.ok();
+            tracing::info!("[AUDIT] Activated kernel probe for cgroup_id={}", cg.id);
+            Some(cg)
+        }
+        Err(e) => {
+            // Non-fatal: audit unavailable (e.g. running without root / cgroup support)
+            tracing::warn!("[AUDIT] Could not create session cgroup: {:#}", e);
+            None
+        }
+    };
 
     // We separate the pair manually because we need ownership of master
     let pair = session.pair;

@@ -277,7 +277,7 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
 
     let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
     let pid = (pid_tgid >> 32) as u32;
-    let ppid = (pid_tgid & 0xffff_ffff) as u32;
+    let tid = (pid_tgid & 0xffff_ffff) as u32;
     let uid_gid = unsafe { bpf_get_current_uid_gid() };
     let uid = (uid_gid & 0xffff_ffff) as u32;
 
@@ -285,7 +285,7 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
     let mut event = AuditEvent {
         cgroup_id,
         pid,
-        ppid,
+        tid,
         uid,
         filename: [0u8; 128],
         args_len: 0,
