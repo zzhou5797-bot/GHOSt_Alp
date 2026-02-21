@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -47,8 +47,23 @@ async fn main() -> Result<()> {
             tracing::info!("Health probe listening on {}", health_addr);
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                    let _ = stream.write_all(response).await;
+                    let mut buf = [0; 128];
+                    // Very simple HTTP check: Read the first few bytes and see if it looks like a GET request
+                    if let Ok(Ok(n)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        stream.read(&mut buf),
+                    )
+                    .await
+                    {
+                        if n >= 4 && &buf[0..4] == b"GET " {
+                            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                            let _ = stream.write_all(response).await;
+                        } else {
+                            // If it's not a GET request, just close it or send 400 Bad Request
+                            let response = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request";
+                            let _ = stream.write_all(response).await;
+                        }
+                    }
                 }
             }
         } else {
@@ -137,7 +152,10 @@ fn configure_server(
 
     // Customize transport config
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into()?));
+    // 4 hours idle timeout for long-lived PTY sessions
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(4 * 60 * 60).try_into()?,
+    ));
     transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     server_config.transport_config(Arc::new(transport_config));
 
