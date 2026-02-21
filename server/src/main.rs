@@ -4,21 +4,15 @@ mod session;
 
 use anyhow::{Context, Result};
 use aya::{
-    maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap},
+    maps::{AsyncPerfEventArray, HashMap as EbpfHashMap},
     programs::{TracePoint, Xdp, XdpFlags},
     Ebpf,
 };
 use bytes::BytesMut;
 use clap::Parser;
-use gateway_ebpf_common::AuditEvent;
+use gateway_ebpf_common::{AuditEvent, AuthState};
 use quinn::{Endpoint, ServerConfig};
-use std::{
-    fs,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
@@ -85,25 +79,8 @@ async fn main() -> Result<()> {
         .context("Failed to attach XDP program")?;
     tracing::info!("XDP Program attached to interface: {}", args.iface);
 
-    // Calculate time offset: UNIX Nano - Uptime Nano
-    let uptime_str = fs::read_to_string("/proc/uptime").context("Failed to read uptime")?;
-    let uptime_secs: f64 = uptime_str
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
-    let uptime_ns = (uptime_secs * 1_000_000_000.0) as u64;
-    let unix_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    let time_delta = unix_ns.saturating_sub(uptime_ns);
-
-    let mut time_delta_map: Array<_, u64> =
-        Array::try_from(bpf.map_mut("TIME_DELTA_MAP").unwrap())?;
-    time_delta_map.set(0, time_delta, 0)?;
-    tracing::info!("TIME_DELTA_MAP initialized with offset: {} ns", time_delta);
+    // V2: TIME_DELTA_MAP has been removed. The Hash Chain verifier is timeless.
+    // No eBPF map initialization needed for time offset.
 
     // Load and attach the audit_execve Tracepoint
     let audit_prog: &mut TracePoint = bpf.program_mut("audit_execve").unwrap().try_into()?;
@@ -113,22 +90,40 @@ async fn main() -> Result<()> {
 
     // Leak bpf to make it 'static — it must live for the duration of the process
     let bpf: &'static mut Ebpf = Box::leak(Box::new(bpf));
+    // SAFETY: bpf is 'static; raw-ptr reborrows prevent lifetime overlap across map calls.
+    let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
+    // SAFETY: bpf is 'static; raw-pointer reborrows prevent lifetime overlap.
+    let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
 
-    let allow_list_map: EbpfHashMap<_, u32, u64> = EbpfHashMap::try_from(
-        bpf.take_map("ALLOW_LIST_MAP")
-            .ok_or_else(|| anyhow::anyhow!("ALLOW_LIST_MAP not found"))?,
-    )?;
+    // ── Shared eBPF maps (map_mut — shareable via Arc<Mutex<>>) ─────────────────────
+    // ALLOW_LIST_MAP: IP → subject (u32). Shared between allowlist task and GC task.
+    let allow_list_map = Arc::new(tokio::sync::Mutex::new(
+        EbpfHashMap::<_, u32, u32>::try_from(
+            unsafe { &mut *bpf_ptr }.map_mut("ALLOW_LIST_MAP")
+                .ok_or_else(|| anyhow::anyhow!("ALLOW_LIST_MAP not found"))?,
+        )?,
+    ));
+
+    // AUTH_STATE_MAP: subject (u32) → AuthState. Shared between GC task only for now.
+    let auth_state_map = Arc::new(tokio::sync::Mutex::new(
+        EbpfHashMap::<_, u32, AuthState>::try_from(
+            unsafe { &mut *bpf_ptr }.map_mut("AUTH_STATE_MAP")
+                .ok_or_else(|| anyhow::anyhow!("AUTH_STATE_MAP not found"))?,
+        )?,
+    ));
+
+    // AUTH_STATE_MAP is managed exclusively by the GC daemon (opened after bpf leak below).
 
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
     // cgroup registration task independently.
     let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
-        bpf.take_map("AUDIT_CGROUP_MAP")
+        unsafe { &mut *bpf_ptr }.take_map("AUDIT_CGROUP_MAP")
             .ok_or_else(|| anyhow::anyhow!("AUDIT_CGROUP_MAP not found"))?,
     )?;
 
     // Consume AuditEvents: spawn one async task per online CPU via AsyncPerfEventArray
     let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(
-        bpf.take_map("AUDIT_EVENTS")
+        unsafe { &mut *bpf_ptr }.take_map("AUDIT_EVENTS")
             .ok_or_else(|| anyhow::anyhow!("AUDIT_EVENTS map not found"))?,
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
@@ -209,33 +204,37 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (allowlist_tx, mut allowlist_rx) = tokio::sync::mpsc::channel::<(u32, bool)>(64);
+    // ── Map Managers ────────────────────────────────────────────────────────────────────────
+    // Channel for session IP registration / deregistration
+    let (allowlist_tx, mut allowlist_rx) = tokio::sync::mpsc::channel::<(u32, u32, bool)>(64);
+
+    // allowlist_rx task: manages ALLOW_LIST_MAP updates from QUIC sessions.
+    // Each message is (ip, subject, add=true|false).
+    let allowlist_allow_map = Arc::clone(&allow_list_map);
     tokio::spawn(async move {
-        let mut map = allow_list_map;
-        let mut ip_ref_counts: std::collections::HashMap<u32, usize> =
+        let mut ip_ref_counts: std::collections::HashMap<u32, (u32, usize)> =
             std::collections::HashMap::new();
 
-        while let Some((ip, add)) = allowlist_rx.recv().await {
+        while let Some((ip, subject, add)) = allowlist_rx.recv().await {
+            let mut allow_map = allowlist_allow_map.lock().await;
             if add {
-                let count = ip_ref_counts.entry(ip).or_insert(0);
-                *count += 1;
-                // Only push rule to eBPF when the first connection for an IP establishes
-                if *count == 1 {
-                    let _ = map.insert(ip, u64::MAX, 0);
+                let entry = ip_ref_counts.entry(ip).or_insert((subject, 0));
+                entry.1 += 1;
+                if entry.1 == 1 {
+                    let _ = allow_map.insert(ip, subject, 0);
+                    tracing::info!("ALLOW_LIST: +{} (subject={})", ip, subject);
                 }
-            } else {
-                if let std::collections::hash_map::Entry::Occupied(mut entry) =
-                    ip_ref_counts.entry(ip)
-                {
-                    let count = entry.get_mut();
-                    if *count > 0 {
-                        *count -= 1;
-                    }
-                    // Only remove rule from eBPF when the last connection for an IP terminates
-                    if *count == 0 {
-                        let _ = map.remove(&ip);
-                        entry.remove();
-                    }
+            } else if let std::collections::hash_map::Entry::Occupied(mut e) =
+                ip_ref_counts.entry(ip)
+            {
+                let count = &mut e.get_mut().1;
+                if *count > 0 {
+                    *count -= 1;
+                }
+                if *count == 0 {
+                    let _ = allow_map.remove(&ip);
+                    e.remove();
+                    tracing::info!("ALLOW_LIST: -{} (fully evicted)", ip);
                 }
             }
         }
@@ -260,6 +259,96 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // ── M1.3: eBPF Map GC Daemon ──────────────────────────────────────────────────────────
+    // Scans AUTH_STATE_MAP every GC_INTERVAL seconds.
+    // Purges entries that are:
+    //   (a) quota-exhausted: auth.quota_bytes == 0
+    //   (b) dead sessions:   bucket_tokens == 0 AND last_refill_ns is stale (>DEAD_NS ago)
+    // For each purged subject, also removes the reverse IP binding from ALLOW_LIST_MAP.
+    {
+        const GC_INTERVAL_SECS: u64 = 10;
+        const DEAD_NS: u64 = 30_000_000_000; // 30 s with no traffic = dead session
+
+        // GC gets clones of the shared Arc handles.
+        let gc_allow_map = Arc::clone(&allow_list_map);
+        let gc_auth_map = Arc::clone(&auth_state_map);
+
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(GC_INTERVAL_SECS));
+            interval.tick().await; // skip first immediate tick
+
+            loop {
+                interval.tick().await;
+
+                // Collect current kernel monotonic ns via /proc/uptime (user-space equivalent)
+                // We use /proc/uptime to derive ktime_ns equivalent without entering kernel.
+                let ktime_ns: u64 = std::fs::read_to_string("/proc/uptime")
+                    .ok()
+                    .and_then(|s| {
+                        s.split_whitespace()
+                            .next()
+                            .and_then(|v| v.parse::<f64>().ok())
+                    })
+                    .map(|secs| (secs * 1_000_000_000.0) as u64)
+                    .unwrap_or(0);
+
+                // Collect subjects to evict
+                let mut to_evict: Vec<u32> = Vec::new();
+                let auth_map = gc_auth_map.lock().await;
+                let subjects: Vec<u32> = auth_map.keys().filter_map(|r| r.ok()).collect();
+
+                for subject in &subjects {
+                    if let Ok(state) = auth_map.get(subject, 0) {
+                        let is_exhausted = state.quota_bytes == 0;
+                        let elapsed = ktime_ns.saturating_sub(state.last_refill_ns);
+                        let is_dead = state.bucket_tokens == 0 && elapsed > DEAD_NS;
+
+                        if is_exhausted {
+                            tracing::info!("[GC] subject={} quota exhausted — evicting", subject);
+                            to_evict.push(*subject);
+                        } else if is_dead {
+                            tracing::info!(
+                                "[GC] subject={} idle {}s — evicting dead session",
+                                subject,
+                                elapsed / 1_000_000_000
+                            );
+                            to_evict.push(*subject);
+                        }
+                    }
+                }
+
+                // Also collect any IP entries whose subject has been evicted
+                let allow_map = gc_allow_map.lock().await;
+                let ips_to_remove: Vec<u32> = allow_map
+                    .iter()
+                    .filter_map(|r| r.ok())
+                    .filter(|(_, subj)| to_evict.contains(subj))
+                    .map(|(ip, _)| ip)
+                    .collect();
+                drop(allow_map);
+
+                {
+                    let mut auth_map = gc_auth_map.lock().await;
+                    for subject in &to_evict {
+                        let _ = auth_map.remove(subject);
+                    }
+                }
+                {
+                    let mut allow_map = gc_allow_map.lock().await;
+                    for ip in &ips_to_remove {
+                        let _ = allow_map.remove(ip);
+                        tracing::info!("[GC] removed ALLOW_LIST entry for ip={}", ip);
+                    }
+                }
+
+                if !to_evict.is_empty() {
+                    tracing::info!("[GC] cycle complete: evicted {} session(s)", to_evict.len());
+                }
+            }
+        });
+    }
 
     while let Some(conn) = endpoint.accept().await {
         let token_clone = Arc::clone(&token);
@@ -306,6 +395,7 @@ async fn main() -> Result<()> {
                 cgroup_tx_clone,
                 allowlist_tx_clone,
                 client_ip,
+                1, // TODO(M3): resolve DID subject from mTLS cert CN
             )
             .await
             {
@@ -379,8 +469,9 @@ async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
     cgroup_tx: tokio::sync::mpsc::Sender<(u64, bool)>,
-    allowlist_tx: tokio::sync::mpsc::Sender<(u32, bool)>,
+    allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     client_ip: u32,
+    client_subject: u32,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -395,8 +486,11 @@ async fn handle_connection(
         handshake.pty_size.cols
     );
 
-    // Make the XDP SPA bypass permanent for this session
-    allowlist_tx.send((client_ip, true)).await.ok();
+    // Bind IP <-> subject in ALLOW_LIST_MAP and allow QUIC traffic
+    allowlist_tx
+        .send((client_ip, client_subject, true))
+        .await
+        .ok();
 
     // 3. Prepare empty Session Cgroup FIRST
     static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -563,8 +657,8 @@ async fn handle_connection(
         let _ = cgroup_tx.send((cg.id, false)).await;
     }
 
-    // Remove the permanent XDP bypass now that the connection is closed
-    let _ = allowlist_tx.send((client_ip, false)).await;
+    // Remove the IP binding when the session ends
+    let _ = allowlist_tx.send((client_ip, client_subject, false)).await;
 
     Ok(())
 }
