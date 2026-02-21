@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use aya::{
-    maps::Array,
-    programs::{Xdp, XdpFlags},
-    Bpf,
+    maps::{Array, AsyncPerfEventArray},
+    programs::{TracePoint, Xdp, XdpFlags},
+    Ebpf,
 };
+use bytes::BytesMut;
 use clap::Parser;
+use gateway_ebpf_common::AuditEvent;
 use quinn::{Endpoint, ServerConfig};
 use std::{
     fs,
@@ -56,7 +58,7 @@ async fn main() -> Result<()> {
 
     // XDP Loader Routine
     let bpf_path = "target/bpfel-unknown-none/release/gateway-ebpf";
-    let mut bpf = Bpf::load_file(bpf_path).context("Failed to load eBPF XDP program")?;
+    let mut bpf = Ebpf::load_file(bpf_path).context("Failed to load eBPF XDP program")?;
 
     let program: &mut Xdp = bpf.program_mut("gateway_ebpf").unwrap().try_into()?;
     program.load()?;
@@ -84,6 +86,56 @@ async fn main() -> Result<()> {
         Array::try_from(bpf.map_mut("TIME_DELTA_MAP").unwrap())?;
     time_delta_map.set(0, time_delta, 0)?;
     tracing::info!("TIME_DELTA_MAP initialized with offset: {} ns", time_delta);
+
+    // Load and attach the audit_execve Tracepoint
+    let audit_prog: &mut TracePoint = bpf.program_mut("audit_execve").unwrap().try_into()?;
+    audit_prog.load()?;
+    audit_prog.attach("syscalls", "sys_enter_execve")?;
+    tracing::info!("audit_execve tracepoint attached to sys_enter_execve");
+
+    // Leak bpf to make it 'static — it must live for the duration of the process
+    let bpf: &'static mut Ebpf = Box::leak(Box::new(bpf));
+
+    // Consume AuditEvents: spawn one async task per online CPU via AsyncPerfEventArray
+    let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(
+        bpf.map_mut("AUDIT_EVENTS")
+            .ok_or_else(|| anyhow::anyhow!("AUDIT_EVENTS map not found"))?,
+    )?;
+    let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
+
+    for cpu_id in cpus {
+        let mut buf = perf_array.open(cpu_id, None)?;
+        tokio::spawn(async move {
+            let mut buffers: Vec<BytesMut> =
+                (0..10).map(|_| BytesMut::with_capacity(512)).collect();
+            loop {
+                let events = match buf.read_events(&mut buffers).await {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                for i in 0..events.read {
+                    let bytes = &buffers[i];
+                    if bytes.len() >= core::mem::size_of::<AuditEvent>() {
+                        let event: AuditEvent = unsafe {
+                            core::ptr::read_unaligned(bytes.as_ptr() as *const AuditEvent)
+                        };
+                        let filename = bytes_to_str(&event.filename);
+                        let args_len = (event.args_len as usize).min(256);
+                        let args = bytes_to_str(&event.args[..args_len]);
+                        tracing::info!(
+                            "[AUDIT] cgroup={} uid={} pid={} ppid={} exec=\"{}\" argv0=\"{}\"",
+                            event.cgroup_id,
+                            event.uid,
+                            event.pid,
+                            event.ppid,
+                            filename,
+                            args
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn Health Server for K8s Probes
     tokio::spawn(async move {
@@ -152,6 +204,11 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn bytes_to_str(buf: &[u8]) -> &str {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..end]).unwrap_or("<invalid utf8>")
 }
 
 fn configure_server(

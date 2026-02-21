@@ -14,3 +14,19 @@ impl SpaPayload {
     pub const VERSION: u32 = 0x01;
     pub const LEN: usize = core::mem::size_of::<SpaPayload>();
 }
+
+// Kernel audit event emitted on sys_enter_execve, sent via RingBuf to userspace
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AuditEvent {
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub filename: [u8; 128],
+    pub args_len: u32,
+    pub args: [u8; 256],
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for AuditEvent {}

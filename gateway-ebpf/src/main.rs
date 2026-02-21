@@ -2,10 +2,15 @@
 #![no_main]
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{Array, HashMap, LruHashMap};
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerfEventArray};
+use aya_ebpf::{
+    bindings::xdp_action,
+    helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
+    macros::{tracepoint, xdp},
+    programs::{TracePointContext, XdpContext},
+};
 use core::mem;
-use gateway_ebpf_common::SpaPayload;
+use gateway_ebpf_common::{AuditEvent, SpaPayload};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -20,6 +25,13 @@ static REPLAY_FILTER_MAP: LruHashMap<[u8; 8], u64> = LruHashMap::with_max_entrie
 
 #[map]
 static ALLOW_LIST_MAP: HashMap<u32, u64> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static AUDIT_EVENTS: PerfEventArray<AuditEvent> = PerfEventArray::new(0);
+
+// Cgroup ID allowlist: only sessions whose cgroup_id is in this map will emit audit events
+#[map]
+static AUDIT_CGROUP_MAP: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
 #[inline(always)]
 fn rotate_left(x: u64, b: u32) -> u64 {
@@ -245,6 +257,83 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     let _ = ALLOW_LIST_MAP.insert(&ipv4_source, &expiry_time, 0);
 
     Ok(xdp_action::XDP_DROP) // Still drop the knock packet itself silently
+}
+
+// Tracepoint hook: fires on every execve(2) syscall entry in the kernel
+#[tracepoint]
+pub fn audit_execve(ctx: TracePointContext) -> u32 {
+    match try_audit_execve(ctx) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
+    // Check if the current process belongs to a tracked cgroup
+    let cgroup_id = unsafe { aya_ebpf::helpers::bpf_get_current_cgroup_id() };
+    if unsafe { AUDIT_CGROUP_MAP.get(&cgroup_id).is_none() } {
+        return Ok(()); // Not a tracked session
+    }
+
+    let pid_tgid = unsafe { bpf_get_current_pid_tgid() };
+    let pid = (pid_tgid >> 32) as u32;
+    let ppid = (pid_tgid & 0xffff_ffff) as u32;
+    let uid_gid = unsafe { bpf_get_current_uid_gid() };
+    let uid = (uid_gid & 0xffff_ffff) as u32;
+
+    // Build AuditEvent on the BPF stack (no heap)
+    let mut event = AuditEvent {
+        cgroup_id,
+        pid,
+        ppid,
+        uid,
+        filename: [0u8; 128],
+        args_len: 0,
+        args: [0u8; 256],
+    };
+
+    // sys_enter_execve: +0 __syscall_nr (i32), +8 filename*, +16 argv**, +24 envp**
+    let filename_ptr: u64 = match unsafe { ctx.read_at(8) } {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    unsafe {
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
+            filename_ptr as *const u8,
+            &mut event.filename,
+        );
+    }
+
+    let argv_ptr: u64 = match unsafe { ctx.read_at(16) } {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
+            return Ok(());
+        }
+    };
+
+    let arg0_ptr: u64 =
+        match unsafe { aya_ebpf::helpers::bpf_probe_read_user(argv_ptr as *const u64) } {
+            Ok(v) => v,
+            Err(_) => {
+                unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
+                return Ok(());
+            }
+        };
+
+    if arg0_ptr != 0 {
+        unsafe {
+            let bytes = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
+                arg0_ptr as *const u8,
+                &mut event.args,
+            )
+            .unwrap_or(&[]);
+            event.args_len = bytes.len() as u32;
+        }
+    }
+
+    unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
+    Ok(())
 }
 
 #[panic_handler]

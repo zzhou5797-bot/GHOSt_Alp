@@ -19,4 +19,6 @@ serde_json = "1.0.149"
 subtle = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-aya = "0.11"
+aya = { version = "0.13", features = ["async_tokio"] }
+gateway-ebpf-common = { path = "../gateway-ebpf-common", features = ["user"] }
+bytes = "1"
