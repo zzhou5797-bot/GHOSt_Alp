@@ -102,8 +102,13 @@ impl SessionCgroup {
 impl Drop for SessionCgroup {
     fn drop(&mut self) {
         // Best-effort cleanup: remove the cgroup directory when the session ends.
-        // The cgroup must be empty (no tasks) before it can be removed.
         if self.path.exists() {
+            // 1. Send signal to instantly kill ALL residual/orphan processes in the cgroup tree
+            let kill_file = self.path.join("cgroup.kill");
+            let _ = fs::write(&kill_file, "1\n"); // Ignore error, older kernels may not support this
+
+            // 2. Wait briefly to allow the kernel to reap the tasks, then remove the directory
+            std::thread::sleep(std::time::Duration::from_millis(10));
             if let Err(e) = fs::remove_dir(&self.path) {
                 tracing::warn!(
                     "[CGROUP] Failed to remove cgroup {}: {}",

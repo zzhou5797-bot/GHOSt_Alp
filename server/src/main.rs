@@ -49,7 +49,10 @@ async fn main() -> Result<()> {
     if let Ok(cgroup_procs) = std::env::var("INTERNAL_CGROUP_JOIN") {
         if cgroup_procs != "SKIP" {
             let pid = std::process::id();
-            let _ = fs::write(&cgroup_procs, format!("{}\n", pid));
+            if let Err(e) = fs::write(&cgroup_procs, format!("{}\n", pid)) {
+                eprintln!("FATAL: Failed to join security cgroup: {}", e);
+                std::process::exit(1); // Fail-closed: do not launch an unaudited shell
+            }
         }
         let mut cmd = std::process::Command::new("sh");
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
@@ -209,11 +212,31 @@ async fn main() -> Result<()> {
     let (allowlist_tx, mut allowlist_rx) = tokio::sync::mpsc::channel::<(u32, bool)>(64);
     tokio::spawn(async move {
         let mut map = allow_list_map;
+        let mut ip_ref_counts: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
+
         while let Some((ip, add)) = allowlist_rx.recv().await {
             if add {
-                let _ = map.insert(ip, u64::MAX, 0);
+                let count = ip_ref_counts.entry(ip).or_insert(0);
+                *count += 1;
+                // Only push rule to eBPF when the first connection for an IP establishes
+                if *count == 1 {
+                    let _ = map.insert(ip, u64::MAX, 0);
+                }
             } else {
-                let _ = map.remove(&ip);
+                if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                    ip_ref_counts.entry(ip)
+                {
+                    let count = entry.get_mut();
+                    if *count > 0 {
+                        *count -= 1;
+                    }
+                    // Only remove rule from eBPF when the last connection for an IP terminates
+                    if *count == 0 {
+                        let _ = map.remove(&ip);
+                        entry.remove();
+                    }
+                }
             }
         }
     });

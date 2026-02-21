@@ -157,6 +157,11 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     let udp_len = u16::from_be_bytes(unsafe { (*udphdr).len }) as usize;
+    if udp_len < UdpHdr::LEN {
+        // Drop malformed packets to prevent integer underflow
+        return Ok(xdp_action::XDP_DROP);
+    }
+
     let payload_offset = udp_offset + UdpHdr::LEN;
     let payload_len = udp_len - UdpHdr::LEN;
 
