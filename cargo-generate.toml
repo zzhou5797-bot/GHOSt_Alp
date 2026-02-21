@@ -1,0 +1,4 @@
+[values]
+xdp_link_interface = "eth0"
+program_type = "xdp"
+aya_std = "no"

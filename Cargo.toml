@@ -2,6 +2,6 @@
 members = [
     "shared",
     "server",
-    "client",
+    "client", "gateway-ebpf-common", "gateway-ebpf", "xtask",
 ]
 resolver = "2"

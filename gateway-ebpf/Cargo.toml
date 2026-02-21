@@ -1,0 +1,26 @@
+[package]
+name = "gateway-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1.0"
+aya-log-ebpf = "0.1.0"
+network-types = "0.1.0"
+gateway-ebpf-common = { path = "../gateway-ebpf-common" }
+
+[build-dependencies]
+aya-build = "0.1.0"
+
+[[bin]]
+name = "gateway-ebpf"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+opt-level = 3
+debug = false
+
+[profile.dev]
+panic = "abort"
