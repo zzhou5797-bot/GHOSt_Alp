@@ -292,8 +292,8 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
         args: [0u8; 256],
     };
 
-    // sys_enter_execve: +0 __syscall_nr (i32), +8 filename*, +16 argv**, +24 envp**
-    let filename_ptr: u64 = match unsafe { ctx.read_at(8) } {
+    // sys_enter_execve: +0 struct trace_entry (8), +8 __syscall_nr (4 + 4 pad), +16 filename*, +24 argv**, +32 envp**
+    let filename_ptr: u64 = match unsafe { ctx.read_at(16) } {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
@@ -304,7 +304,7 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
         );
     }
 
-    let argv_ptr: u64 = match unsafe { ctx.read_at(16) } {
+    let argv_ptr: u64 = match unsafe { ctx.read_at(24) } {
         Ok(v) => v,
         Err(_) => {
             unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
@@ -312,9 +312,9 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
         }
     };
 
-    let mut offset: usize = 0;
+    let mut num_args = 0;
 
-    // Read up to 5 arguments from argv
+    // Read up to 5 arguments from argv into fixed-size chunks to satisfy BPF verifier
     for i in 0..5 {
         let arg_ptr_addr = (argv_ptr as usize + i * core::mem::size_of::<u64>()) as *const u64;
         let arg_ptr: u64 = match unsafe { aya_ebpf::helpers::bpf_probe_read_user(arg_ptr_addr) } {
@@ -326,34 +326,21 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
             break; // Null terminator of argv array
         }
 
-        // Add a space between arguments
-        if offset > 0 && offset < 255 {
-            event.args[offset] = b' ';
-            offset += 1;
-        }
-
-        if offset >= 256 {
-            break;
-        }
-
-        let dest = &mut event.args[offset..];
-        let read_len = match unsafe {
-            aya_ebpf::helpers::bpf_probe_read_user_str_bytes(arg_ptr as *const u8, dest)
-        } {
-            Ok(bytes) => bytes.len(),
-            Err(_) => break,
+        let dest = match i {
+            0 => &mut event.args[0..51],
+            1 => &mut event.args[51..102],
+            2 => &mut event.args[102..153],
+            3 => &mut event.args[153..204],
+            4 => &mut event.args[204..255],
+            _ => break,
         };
 
-        if read_len > 0 {
-            // bpf_probe_read_user_str_bytes may include the null terminator.
-            // If the last byte is 0, we don't advance the offset past it, so that the next argument
-            // can overwrite it (with a space or the next char), or it just remains 0.
-            let null_offset = if dest[read_len - 1] == 0 { 1 } else { 0 };
-            offset += read_len - null_offset;
-        }
+        let _ =
+            unsafe { aya_ebpf::helpers::bpf_probe_read_user_str_bytes(arg_ptr as *const u8, dest) };
+        num_args += 1;
     }
 
-    event.args_len = offset as u32;
+    event.args_len = num_args as u32;
 
     unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
     Ok(())

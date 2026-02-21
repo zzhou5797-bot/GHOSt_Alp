@@ -131,10 +131,19 @@ async fn main() -> Result<()> {
                             core::ptr::read_unaligned(bytes.as_ptr() as *const AuditEvent)
                         };
                         let filename = bytes_to_str(&event.filename);
-                        let args_len = (event.args_len as usize).min(256);
-                        let args = bytes_to_str(&event.args[..args_len]);
+
+                        let mut args_vec = Vec::new();
+                        let max_args = (event.args_len as usize).min(5);
+                        for chunk in event.args.chunks(51).take(max_args) {
+                            let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
+                            if end > 0 {
+                                args_vec.push(bytes_to_str(&chunk[..end]));
+                            }
+                        }
+                        let args = args_vec.join(" ");
+
                         tracing::info!(
-                            "[AUDIT] cgroup={} uid={} pid={} tid={} exec=\"{}\" argv0=\"{}\"",
+                            "[AUDIT] cgroup={} uid={} pid={} tid={} exec=\"{}\" argv=\"{}\"",
                             event.cgroup_id,
                             event.uid,
                             event.pid,
