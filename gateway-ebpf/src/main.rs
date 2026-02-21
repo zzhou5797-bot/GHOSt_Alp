@@ -312,25 +312,48 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
         }
     };
 
-    let arg0_ptr: u64 =
-        match unsafe { aya_ebpf::helpers::bpf_probe_read_user(argv_ptr as *const u64) } {
+    let mut offset: usize = 0;
+
+    // Read up to 5 arguments from argv
+    for i in 0..5 {
+        let arg_ptr_addr = (argv_ptr as usize + i * core::mem::size_of::<u64>()) as *const u64;
+        let arg_ptr: u64 = match unsafe { aya_ebpf::helpers::bpf_probe_read_user(arg_ptr_addr) } {
             Ok(v) => v,
-            Err(_) => {
-                unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
-                return Ok(());
-            }
+            Err(_) => break,
         };
 
-    if arg0_ptr != 0 {
-        unsafe {
-            let bytes = aya_ebpf::helpers::bpf_probe_read_user_str_bytes(
-                arg0_ptr as *const u8,
-                &mut event.args,
-            )
-            .unwrap_or(&[]);
-            event.args_len = bytes.len() as u32;
+        if arg_ptr == 0 {
+            break; // Null terminator of argv array
+        }
+
+        // Add a space between arguments
+        if offset > 0 && offset < 255 {
+            event.args[offset] = b' ';
+            offset += 1;
+        }
+
+        if offset >= 256 {
+            break;
+        }
+
+        let dest = &mut event.args[offset..];
+        let read_len = match unsafe {
+            aya_ebpf::helpers::bpf_probe_read_user_str_bytes(arg_ptr as *const u8, dest)
+        } {
+            Ok(bytes) => bytes.len(),
+            Err(_) => break,
+        };
+
+        if read_len > 0 {
+            // bpf_probe_read_user_str_bytes may include the null terminator.
+            // If the last byte is 0, we don't advance the offset past it, so that the next argument
+            // can overwrite it (with a space or the next char), or it just remains 0.
+            let null_offset = if dest[read_len - 1] == 0 { 1 } else { 0 };
+            offset += read_len - null_offset;
         }
     }
+
+    event.args_len = offset as u32;
 
     unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
     Ok(())
