@@ -2,8 +2,15 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use quinn::{ClientConfig, Endpoint, TransportConfig};
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -25,6 +32,72 @@ struct Args {
 
     #[arg(long, env = "GATEWAY_TOKEN", default_value = "secret-token")]
     token: String,
+
+    #[arg(
+        long,
+        env = "SPA_KEY",
+        default_value = "deadbeef01020304badc0ffe0a0b0c0d"
+    )]
+    spa_key: String,
+}
+
+#[inline(always)]
+fn rotate_left(x: u64, b: u32) -> u64 {
+    (x << b) | (x >> (64 - b))
+}
+
+#[inline(always)]
+fn siphash24_compress(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+    *v0 = v0.wrapping_add(*v1);
+    *v1 = rotate_left(*v1, 13);
+    *v1 ^= *v0;
+    *v0 = rotate_left(*v0, 32);
+
+    *v2 = v2.wrapping_add(*v3);
+    *v3 = rotate_left(*v3, 16);
+    *v3 ^= *v2;
+
+    *v0 = v0.wrapping_add(*v3);
+    *v3 = rotate_left(*v3, 21);
+    *v3 ^= *v0;
+
+    *v2 = v2.wrapping_add(*v1);
+    *v1 = rotate_left(*v1, 17);
+    *v1 ^= *v2;
+    *v2 = rotate_left(*v2, 32);
+}
+
+pub fn siphash24_16b(k0: u64, k1: u64, m0: u64, m1: u64) -> [u8; 8] {
+    let mut v0 = k0 ^ 0x736f6d6570736575;
+    let mut v1 = k1 ^ 0x646f72616e646f6d;
+    let mut v2 = k0 ^ 0x6c7967656e657261;
+    let mut v3 = k1 ^ 0x7465646279746573;
+
+    let b = (16 as u64) << 56;
+
+    v3 ^= m0;
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= m0;
+
+    v3 ^= m1;
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= m1;
+
+    v3 ^= b;
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= b;
+
+    v2 ^= 0xff;
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+    siphash24_compress(&mut v0, &mut v1, &mut v2, &mut v3);
+
+    let h = v0 ^ v1 ^ v2 ^ v3;
+    h.to_le_bytes()
 }
 
 #[tokio::main]
@@ -90,7 +163,51 @@ async fn run_client(args: Args) -> Result<()> {
         .parse()
         .context("Invalid address")?;
 
-    eprintln!("Connecting to {}...\r", remote_addr);
+    eprintln!("Sending SPA Knock to {}...\r", remote_addr);
+
+    // SPA Knock Sequence
+    let spa_socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("Failed to bind UDP socket for SPA")?;
+    let timestamp_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+
+    let magic: u32 = 0x54535054; // "TSPT"
+    let version: u32 = 0x01;
+
+    let secret_k0: u64 = if args.spa_key.len() == 32 {
+        u64::from_str_radix(&args.spa_key[0..16], 16).unwrap_or(0x04030201efbeadde)
+    } else {
+        0x04030201efbeadde
+    };
+    let secret_k1: u64 = if args.spa_key.len() == 32 {
+        u64::from_str_radix(&args.spa_key[16..32], 16).unwrap_or(0x0d0c0b0affe0dcba)
+    } else {
+        0x0d0c0b0affe0dcba
+    };
+    let m0 = ((magic as u64) << 32) | (version as u64);
+    let m1 = timestamp_ns;
+
+    let signature = siphash24_16b(secret_k0, secret_k1, m0, m1);
+
+    let mut payload = Vec::with_capacity(48);
+    payload.extend_from_slice(&magic.to_be_bytes()); // 4
+    payload.extend_from_slice(&version.to_be_bytes()); // 4
+    payload.extend_from_slice(&timestamp_ns.to_be_bytes()); // 8
+    payload.extend_from_slice(&signature); // 8
+    payload.extend_from_slice(&[0u8; 24]); // 24 bytes padding to match 48-byte payload structure
+
+    spa_socket
+        .send_to(&payload, remote_addr)
+        .await
+        .context("Failed to send SPA knock")?;
+
+    // Slight delay to allow XDP map insertion and network path routing
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    eprintln!("Connecting via QUIC to {}...\r", remote_addr);
 
     let connection = endpoint
         .connect(remote_addr, "localhost")?

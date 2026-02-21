@@ -1,7 +1,18 @@
 use anyhow::{Context, Result};
+use aya::{
+    maps::Array,
+    programs::{Xdp, XdpFlags},
+    Bpf,
+};
 use clap::Parser;
 use quinn::{Endpoint, ServerConfig};
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +33,9 @@ struct Args {
 
     #[arg(long, env = "GATEWAY_TOKEN", default_value = "secret-token")]
     token: String,
+
+    #[arg(long, default_value = "lo")]
+    iface: String,
 }
 
 #[tokio::main]
@@ -39,6 +53,37 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::server(server_config, addr)?;
 
     tracing::info!("QUIC Server listening on {}", endpoint.local_addr()?);
+
+    // XDP Loader Routine
+    let bpf_path = "target/bpfel-unknown-none/release/gateway-ebpf";
+    let mut bpf = Bpf::load_file(bpf_path).context("Failed to load eBPF XDP program")?;
+
+    let program: &mut Xdp = bpf.program_mut("gateway_ebpf").unwrap().try_into()?;
+    program.load()?;
+    program
+        .attach(&args.iface, XdpFlags::default())
+        .context("Failed to attach XDP program")?;
+    tracing::info!("XDP Program attached to interface: {}", args.iface);
+
+    // Calculate time offset: UNIX Nano - Uptime Nano
+    let uptime_str = fs::read_to_string("/proc/uptime").context("Failed to read uptime")?;
+    let uptime_secs: f64 = uptime_str
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let uptime_ns = (uptime_secs * 1_000_000_000.0) as u64;
+    let unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let time_delta = unix_ns.saturating_sub(uptime_ns);
+
+    let mut time_delta_map: Array<_, u64> =
+        Array::try_from(bpf.map_mut("TIME_DELTA_MAP").unwrap())?;
+    time_delta_map.set(0, time_delta, 0)?;
+    tracing::info!("TIME_DELTA_MAP initialized with offset: {} ns", time_delta);
 
     // Spawn Health Server for K8s Probes
     tokio::spawn(async move {
