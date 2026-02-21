@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use aya::{
     maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap},
     programs::{TracePoint, Xdp, XdpFlags},
-    Ebpf,
+    Ebpf, EbpfLoader,
 };
 use bytes::BytesMut;
 use clap::Parser;
@@ -71,7 +71,21 @@ async fn main() -> Result<()> {
 
     // XDP Loader Routine
     let bpf_path = "target/bpfel-unknown-none/release/gateway-ebpf";
-    let mut bpf = Ebpf::load_file(bpf_path).context("Failed to load eBPF XDP program")?;
+
+    // ── Map Pinning: persist all BPF maps across server restarts ────────────────────
+    // EbpfLoader::map_pin_path() pins every map under /sys/fs/bpf/ghostpty/.
+    // On first launch: maps are created, pinned, and loaded into the kernel.
+    // On restart:      the pre-existing pinned maps are reused unchanged,
+    //                  preserving AUTH_STATE_MAP hash-chain state, token
+    //                  buckets, quotas, and ALLOW_LIST_MAP IP bindings.
+    // Reference: https://docs.rs/aya/latest/aya/struct.EbpfLoader.html
+    let bpf_fs = std::path::PathBuf::from("/sys/fs/bpf/ghostpty");
+    std::fs::create_dir_all(&bpf_fs).context("Failed to create /sys/fs/bpf/ghostpty")?;
+
+    let mut bpf = EbpfLoader::new()
+        .map_pin_path(&bpf_fs)
+        .load_file(bpf_path)
+        .context("Failed to load eBPF XDP program")?;
 
     let program: &mut Xdp = bpf.program_mut("gateway_ebpf").unwrap().try_into()?;
     program.load()?;
