@@ -157,14 +157,18 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     let payload: *const SpaPayload = unsafe { ptr_at(&ctx, payload_offset)? };
 
     // 5. Magic Number Check
-    let magic = u32::from_be(unsafe { (*payload).magic });
+    let magic =
+        u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).magic)) });
     if magic != SpaPayload::MAGIC {
         // info!(&ctx, "XDP_DROP: Invalid SPA magic number");
         return Ok(xdp_action::XDP_DROP);
     }
 
-    let version = u32::from_be(unsafe { (*payload).version });
-    let timestamp_ns = u64::from_be(unsafe { (*payload).timestamp_ns });
+    let version =
+        u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).version)) });
+    let timestamp_ns = u64::from_be(unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!((*payload).timestamp_ns))
+    });
 
     // info!(&ctx, "SPA Knock from IPv4 {}, Version: {}, Time: {}", ipv4_source, version, timestamp_ns);
 
@@ -209,7 +213,8 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     let m1 = timestamp_ns;
 
     let computed_sig = siphash24_16b(secret_k0, secret_k1, m0, m1);
-    let packet_sig = unsafe { (*payload).signature };
+    let packet_sig =
+        unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).signature)) };
 
     // Constant-time-like comparison for 8 bytes (since it's SipHash-2-4)
     let mut sig_match = true;
