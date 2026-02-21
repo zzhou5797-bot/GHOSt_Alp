@@ -2,14 +2,14 @@
 #![no_main]
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{HashMap, PerfEventArray};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerfEventArray};
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
     macros::{tracepoint, xdp},
     programs::{TracePointContext, XdpContext},
 };
-use gateway_ebpf_common::{AuditEvent, AuthState, SpaPayload};
+use gateway_ebpf_common::{AuditEvent, AuthState, SpaPayload, SpaPayloadV1};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -28,6 +28,19 @@ static AUDIT_EVENTS: PerfEventArray<AuditEvent> = PerfEventArray::new(0);
 // Cgroup ID allowlist: only sessions whose cgroup_id is in this map will emit audit events
 #[map]
 static AUDIT_CGROUP_MAP: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
+
+// ── v1 backward-compat maps (dual-stack transition period only) ─────────────
+// TIME_DELTA_MAP[0] = UNIX_ns − ktime_ns offset, written by server at startup.
+#[map]
+static TIME_DELTA_MAP: Array<u64> = Array::with_max_entries(1, 0);
+
+// REPLAY_FILTER_MAP: LRU of seen v1 timestamps to prevent replay attacks.
+// Each entry is (timestamp_ns → 1). LRU capacity = 4096 entries ≈ 4096 unique knocks.
+#[map]
+static REPLAY_FILTER_MAP: LruHashMap<u64, u8> = LruHashMap::with_max_entries(4096, 0);
+
+// Subject ID used for v1 (legacy) sessions — all share a single AuthState slot.
+const V1_SUBJECT: u32 = 0xFFFF_FFFE;
 
 #[inline(always)]
 fn rotate_left(x: u64, b: u32) -> u64 {
@@ -103,6 +116,65 @@ unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     }
 
     Ok((start + offset) as *const T)
+}
+
+// \u2500\u2500 v1 Knock Handler (legacy timestamp-based SPA) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Called when version == 1. Performs:
+//   1. Parse SpaPayloadV1 (timestamp_ns)
+//   2. Convert ktime to unix_ns via TIME_DELTA_MAP[0]
+//   3. Check |timestamp - unix_now| <= 60 s (recency window)
+//   4. Anti-replay check via REPLAY_FILTER_MAP
+//   5. Bootstrap AuthState for V1_SUBJECT (limited: 1 token, no quota)
+//   6. Bind source IP in ALLOW_LIST_MAP → V1_SUBJECT
+// Always returns XDP_DROP (silent knock; QUIC connect triggers the real check).
+#[inline(always)]
+fn handle_v1_knock(ctx: &XdpContext, payload_offset: usize, ipv4_source: u32) -> Result<u32, ()> {
+    const V1_WINDOW_NS: u64 = 60_000_000_000; // 60 seconds
+
+    let v1_payload: *const SpaPayloadV1 = unsafe { ptr_at(ctx, payload_offset)? };
+    let timestamp_ns = u64::from_be(unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!((*v1_payload).timestamp_ns))
+    });
+
+    // Get ktime-\u003eunix offset from TIME_DELTA_MAP
+    let time_delta = match unsafe { TIME_DELTA_MAP.get(0) } {
+        Some(d) => *d,
+        None => return Ok(xdp_action::XDP_DROP), // Server not initialized
+    };
+    let ktime_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    let unix_now = ktime_ns.saturating_add(time_delta);
+
+    // Recency check: reject packets outside the 60 s window
+    let diff = if unix_now > timestamp_ns {
+        unix_now - timestamp_ns
+    } else {
+        timestamp_ns - unix_now
+    };
+    if diff > V1_WINDOW_NS {
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // Anti-replay: drop if this timestamp was already seen
+    if unsafe { REPLAY_FILTER_MAP.get(&timestamp_ns) }.is_some() {
+        return Ok(xdp_action::XDP_DROP);
+    }
+    // Mark as seen (LRU evicts oldest entry automatically)
+    let _ = unsafe { REPLAY_FILTER_MAP.insert(&timestamp_ns, &1u8, 0) };
+
+    // Bootstrap or refresh the shared V1_SUBJECT AuthState with 1 token
+    let v1_auth = AuthState {
+        expected_seq: 0,
+        anchor_hash_lo: 0,
+        bucket_tokens: 1, // One-shot: enough for the QUIC handshake
+        last_refill_ns: ktime_ns,
+        quota_bytes: 1_000_000_000, // 1 GiB default quota for legacy sessions
+    };
+    let _ = unsafe { AUTH_STATE_MAP.insert(&V1_SUBJECT, &v1_auth, 0) };
+
+    // Bind source IP to V1_SUBJECT so the hot path lets QUIC through
+    let _ = unsafe { ALLOW_LIST_MAP.insert(&ipv4_source, &V1_SUBJECT, 0) };
+
+    Ok(xdp_action::XDP_DROP) // Silent knock — QUIC layer does the rest
 }
 
 #[xdp]
@@ -202,8 +274,15 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    let _version =
+    let version =
         u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).version)) });
+
+    // ── Version Discriminator: route to the correct SPA verification path ────────
+    if version == SpaPayloadV1::VERSION {
+        return handle_v1_knock(&ctx, payload_offset, ipv4_source);
+    }
+
+    // ── V2: Hash Chain path (current) ────────────────────────────────────────────
     let subject =
         u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).subject)) });
     let seq =

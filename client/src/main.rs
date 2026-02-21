@@ -202,6 +202,51 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+
+/// Send a v1 (timestamp-based) SPA knock to `remote_addr` via `socket`.
+async fn send_spa_v1(
+    socket: &tokio::net::UdpSocket,
+    remote_addr: std::net::SocketAddr,
+    k0: u64,
+    k1: u64,
+) -> anyhow::Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("System time error")?
+        .as_nanos() as u64;
+    let sig = siphash24_16b(k0, k1, timestamp_ns >> 32, timestamp_ns & 0xFFFF_FFFF);
+    let mut payload = Vec::with_capacity(48);
+    payload.extend_from_slice(&0x5453_5054u32.to_be_bytes()); // magic
+    payload.extend_from_slice(&1u32.to_be_bytes());           // version = 1
+    payload.extend_from_slice(&0u32.to_be_bytes());           // pad
+    payload.extend_from_slice(&timestamp_ns.to_be_bytes());
+    payload.extend_from_slice(&sig);
+    payload.extend_from_slice(&[0u8; 24]);
+    socket.send_to(&payload, remote_addr).await.context("v1 SPA send failed")?;
+    Ok(())
+}
+
+/// Full v1 fallback: send v1 knock, wait 50 ms, connect QUIC, return connection.
+async fn try_v1_fallback(
+    endpoint: quinn::Endpoint,
+    remote_addr: std::net::SocketAddr,
+    spa_socket: &tokio::net::UdpSocket,
+    k0: u64,
+    k1: u64,
+    _token: &str,
+) -> anyhow::Result<quinn::Connection> {
+    send_spa_v1(spa_socket, remote_addr, k0, k1).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    eprintln!("QUIC: connecting via v1 fallback path...\r");
+    let conn = endpoint
+        .connect(remote_addr, "localhost")?
+        .await
+        .context("v1 fallback QUIC connect failed")?;
+    eprintln!("Connected (v1 legacy)!\r");
+    Ok(conn)
+}
+
 async fn run_client(args: Args) -> Result<()> {
     // 1. Load CA cert
     let ca_cert_pem =
@@ -248,82 +293,84 @@ async fn run_client(args: Args) -> Result<()> {
         .parse()
         .context("Invalid address")?;
 
-    eprintln!("Sending SPA Knock (v2 Hash Chain) to {}...\r", remote_addr);
-
-    // ── V2 Hash Chain SPA ──────────────────────────────────────────────────
+    // ── V2 SPA: derive key material and hash chain position ─────────────────
     let secret_k0: u64 = if args.spa_key.len() == 32 {
         u64::from_str_radix(&args.spa_key[0..16], 16).unwrap_or(0x04030201efbeadde)
-    } else {
-        0x04030201efbeadde
-    };
+    } else { 0x04030201efbeadde };
     let secret_k1: u64 = if args.spa_key.len() == 32 {
         u64::from_str_radix(&args.spa_key[16..32], 16).unwrap_or(0x0d0c0b0affe0dcba)
-    } else {
-        0x0d0c0b0affe0dcba
-    };
-
-    // Parse seed from hex string (first 16 hex chars = 8 bytes)
-    let seed_hex = if args.seed.len() >= 16 {
-        &args.seed[0..16]
-    } else {
-        "0102030405060708"
-    };
+    } else { 0x0d0c0b0affe0dcba };
+    let seed_hex = if args.seed.len() >= 16 { &args.seed[0..16] } else { "0102030405060708" };
     let seed_u64 = u64::from_str_radix(seed_hex, 16).unwrap_or(0x0102030405060708);
     let seed: [u8; 8] = seed_u64.to_le_bytes();
-
-    // Load or initialise persistent chain state
-    let (mut current_seq, chain_seed) =
-        load_or_init_state(&args.state_file, seed, args.chain_depth)?;
-
+    let (mut current_seq, chain_seed) = load_or_init_state(&args.state_file, seed, args.chain_depth)?;
     if current_seq == 0 {
-        bail!("Hash chain exhausted (seq=0). Regenerate with a new seed and re-register H_N with the gateway.");
+        anyhow::bail!("Hash chain exhausted (seq=0). Re-register H_N with the gateway.");
     }
-
-    // H_{current_seq} is our knock hash for this session
     let knock_hash = get_hash_at_seq(chain_seed, current_seq, secret_k0, secret_k1);
-
-    // Persist decremented seq BEFORE the network send (fail-safe: if we crash after
-    // sending, seq is still consumed, preventing any replay of the same hash).
     let next_seq = current_seq - 1;
     save_state(&args.state_file, chain_seed, next_seq)?;
     current_seq = next_seq;
+    let subject: u32 = args.subject;
     eprintln!("Ghost Chain: seq={} remaining\r", current_seq);
 
-    // Assemble V2 SpaPayload (60 bytes):
-    //   magic(4) + version(4) + subject(4) + seq(8) + hash(8) + signature(32=zeros for now)
-    let magic: u32 = 0x54535054; // "TSPT"
-    let version: u32 = 0x02;
-    let subject: u32 = args.subject;
-    let _seq_wire: u64 = (current_seq + 1).to_be(); // computed but sent inline below
+        eprintln!("SPA: sending v2 Hash Chain knock to {}...\r", remote_addr);
 
-    let mut payload: Vec<u8> = Vec::with_capacity(60);
-    payload.extend_from_slice(&magic.to_be_bytes()); // 4
-    payload.extend_from_slice(&version.to_be_bytes()); // 4
-    payload.extend_from_slice(&subject.to_be_bytes()); // 4
-    payload.extend_from_slice(&(current_seq + 1).to_be_bytes()); // 8 — seq in network byte order
-    payload.extend_from_slice(&knock_hash); // 8
-    payload.extend_from_slice(&[0u8; 32]); // 32 signature placeholder
+    // ── Assemble V2 SpaPayload (60 bytes) ────────────────────────────────────
+    let mut v2_payload: Vec<u8> = Vec::with_capacity(60);
+    v2_payload.extend_from_slice(&(0x5453_5054u32).to_be_bytes()); // magic
+    v2_payload.extend_from_slice(&2u32.to_be_bytes()); // version
+    v2_payload.extend_from_slice(&subject.to_be_bytes());
+    v2_payload.extend_from_slice(&(current_seq + 1).to_be_bytes());
+    v2_payload.extend_from_slice(&knock_hash);
+    v2_payload.extend_from_slice(&[0u8; 32]); // signature placeholder
 
     let spa_socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .context("Failed to bind UDP socket for SPA")?;
-
     spa_socket
-        .send_to(&payload, remote_addr)
+        .send_to(&v2_payload, remote_addr)
         .await
-        .context("Failed to send SPA knock")?;
+        .context("Failed to send v2 SPA knock")?;
 
-    // Slight delay to allow XDP map insertion and network path routing
+    // Allow XDP map insertion to propagate (~50 ms)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    eprintln!("Connecting via QUIC to {}...\r", remote_addr);
-
-    let connection = endpoint
-        .connect(remote_addr, "localhost")?
-        .await
-        .context("Failed to connect")?;
-
-    eprintln!("Connected! Handshaking...\r");
+    // ── Attempt QUIC connect with short timeout (v2 path) ────────────────────
+    eprintln!("QUIC: connecting via v2 path to {}...\r", remote_addr);
+    let v2_fut = endpoint.connect(remote_addr, "localhost")?;
+    let connection = match tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        v2_fut,
+    ).await {
+        Ok(Ok(conn)) => {
+            eprintln!("Connected (v2 Hash Chain)!\r");
+            conn
+        }
+        Ok(Err(e)) => {
+            eprintln!("QUIC v2 connect error: {}. Falling back to v1...\r", e);
+            return try_v1_fallback(
+                endpoint,
+                remote_addr,
+                &spa_socket,
+                secret_k0,
+                secret_k1,
+                &args.token,
+            )
+            .await
+            .map(|_| ());
+        }
+        Err(_) => {
+            eprintln!("QUIC v2 timeout after 150ms. Sending v1 SPA knock + retry...\r");
+            send_spa_v1(&spa_socket, remote_addr, secret_k0, secret_k1).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            eprintln!("QUIC: connecting via v1 fallback path...\r");
+            endpoint
+                .connect(remote_addr, "localhost")?
+                .await
+                .context("v1 fallback QUIC connect failed")?
+        }
+    };
 
     // 1. Open Control Stream FIRST
     let mut control_tx = connection.open_uni().await?;

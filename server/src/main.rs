@@ -1,10 +1,11 @@
 mod cgroup;
+mod dataplane;
 mod protocol;
 mod session;
 
 use anyhow::{Context, Result};
 use aya::{
-    maps::{AsyncPerfEventArray, HashMap as EbpfHashMap},
+    maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap},
     programs::{TracePoint, Xdp, XdpFlags},
     Ebpf,
 };
@@ -79,8 +80,32 @@ async fn main() -> Result<()> {
         .context("Failed to attach XDP program")?;
     tracing::info!("XDP Program attached to interface: {}", args.iface);
 
-    // V2: TIME_DELTA_MAP has been removed. The Hash Chain verifier is timeless.
-    // No eBPF map initialization needed for time offset.
+    // ── v1 compat: restore TIME_DELTA_MAP (UNIX_ns − ktime_ns offset) ──────────────────
+    // Required for the dual-stack XDP path (handle_v1_knock uses this to convert
+    // ktime to unix time for the 60 s recency window). Has zero cost when no v1
+    // clients connect; the map slot is simply unused.
+    {
+        let uptime_str = fs::read_to_string("/proc/uptime").context("read /proc/uptime")?;
+        let uptime_secs: f64 = uptime_str
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let uptime_ns = (uptime_secs * 1_000_000_000.0) as u64;
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let time_delta = unix_ns.saturating_sub(uptime_ns);
+        let mut time_delta_map: Array<_, u64> =
+            Array::try_from(bpf.map_mut("TIME_DELTA_MAP").unwrap())?;
+        time_delta_map.set(0, time_delta, 0)?;
+        tracing::info!(
+            "TIME_DELTA_MAP initialized: delta={} ns (v1 compat)",
+            time_delta
+        );
+    }
 
     // Load and attach the audit_execve Tracepoint
     let audit_prog: &mut TracePoint = bpf.program_mut("audit_execve").unwrap().try_into()?;
@@ -92,14 +117,13 @@ async fn main() -> Result<()> {
     let bpf: &'static mut Ebpf = Box::leak(Box::new(bpf));
     // SAFETY: bpf is 'static; raw-ptr reborrows prevent lifetime overlap across map calls.
     let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
-    // SAFETY: bpf is 'static; raw-pointer reborrows prevent lifetime overlap.
-    let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
 
     // ── Shared eBPF maps (map_mut — shareable via Arc<Mutex<>>) ─────────────────────
     // ALLOW_LIST_MAP: IP → subject (u32). Shared between allowlist task and GC task.
     let allow_list_map = Arc::new(tokio::sync::Mutex::new(
         EbpfHashMap::<_, u32, u32>::try_from(
-            unsafe { &mut *bpf_ptr }.map_mut("ALLOW_LIST_MAP")
+            unsafe { &mut *bpf_ptr }
+                .map_mut("ALLOW_LIST_MAP")
                 .ok_or_else(|| anyhow::anyhow!("ALLOW_LIST_MAP not found"))?,
         )?,
     ));
@@ -107,7 +131,8 @@ async fn main() -> Result<()> {
     // AUTH_STATE_MAP: subject (u32) → AuthState. Shared between GC task only for now.
     let auth_state_map = Arc::new(tokio::sync::Mutex::new(
         EbpfHashMap::<_, u32, AuthState>::try_from(
-            unsafe { &mut *bpf_ptr }.map_mut("AUTH_STATE_MAP")
+            unsafe { &mut *bpf_ptr }
+                .map_mut("AUTH_STATE_MAP")
                 .ok_or_else(|| anyhow::anyhow!("AUTH_STATE_MAP not found"))?,
         )?,
     ));
@@ -117,13 +142,15 @@ async fn main() -> Result<()> {
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
     // cgroup registration task independently.
     let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
-        unsafe { &mut *bpf_ptr }.take_map("AUDIT_CGROUP_MAP")
+        unsafe { &mut *bpf_ptr }
+            .take_map("AUDIT_CGROUP_MAP")
             .ok_or_else(|| anyhow::anyhow!("AUDIT_CGROUP_MAP not found"))?,
     )?;
 
     // Consume AuditEvents: spawn one async task per online CPU via AsyncPerfEventArray
     let mut perf_array: AsyncPerfEventArray<_> = AsyncPerfEventArray::try_from(
-        unsafe { &mut *bpf_ptr }.take_map("AUDIT_EVENTS")
+        unsafe { &mut *bpf_ptr }
+            .take_map("AUDIT_EVENTS")
             .ok_or_else(|| anyhow::anyhow!("AUDIT_EVENTS map not found"))?,
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);

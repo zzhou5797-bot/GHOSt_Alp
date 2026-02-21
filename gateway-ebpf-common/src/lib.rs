@@ -1,6 +1,6 @@
 #![no_std]
 
-// 60 bytes SPA Payload layout
+// 60-byte SPA Payload v2 (current spec)
 #[repr(C, packed)]
 pub struct SpaPayload {
     pub magic: u32,          // 0x54535054 ("TSPT")
@@ -15,6 +15,24 @@ impl SpaPayload {
     pub const MAGIC: u32 = 0x54535054;
     pub const VERSION: u32 = 0x02;
     pub const LEN: usize = core::mem::size_of::<SpaPayload>();
+}
+
+// 48-byte SPA Payload v1 (legacy timestamp-based, backward compat window)
+// Layout: magic(4) + version(4) + unused_subject(4) + timestamp_ns(8) + signature(8) + pad(24)
+// Clients send version=1 if they do not yet support the v2 hash chain.
+#[repr(C, packed)]
+pub struct SpaPayloadV1 {
+    pub magic: u32,         // 0x54535054 ("TSPT")
+    pub version: u32,       // 0x01
+    pub _pad: u32,          // ignored (was subject in draft v1)
+    pub timestamp_ns: u64,  // UNIX nanoseconds
+    pub signature: [u8; 8], // SipHash(secret, magic|version, timestamp_ns)
+}
+
+impl SpaPayloadV1 {
+    pub const MAGIC: u32 = 0x54535054;
+    pub const VERSION: u32 = 0x01;
+    pub const LEN: usize = core::mem::size_of::<SpaPayloadV1>();
 }
 
 // BPF Map value that tracks per-DID authentication state AND rate-limiting.
