@@ -164,3 +164,121 @@ fn test_state_fast_forward_and_next_knock() {
         "Post-fast-forward sequential knock must pass"
     );
 }
+
+// ── Phase 1.2: Token Bucket tests ─────────────────────────────────────────
+//
+// The token bucket is a simple leaky-bucket algorithm:
+//   * MAX_TOKENS = 512 (burst cap)
+//   * REFILL_INTERVAL_NS = 1_000_000 (1 token per 1 ms → ~1000 pps sustained)
+// Mirror the constants from AuthState::* so this stays in sync.
+
+const TB_MAX_TOKENS: u64 = 512;
+const TB_REFILL_NS: u64 = 1_000_000; // 1 ms
+
+/// Simulate one XDP packet arrival:
+///   `now_ns`     - fake kernel monotonic timestamp for this packet
+///   `last_ns`    - last refill timestamp stored in AuthState
+///   `tokens_in`  - bucket tokens before this packet
+/// Returns `(allowed, tokens_out, last_ns_out)`.
+fn token_bucket_tick(now_ns: u64, last_ns: u64, tokens_in: u64) -> (bool, u64, u64) {
+    let elapsed = now_ns.saturating_sub(last_ns);
+    let earned = elapsed / TB_REFILL_NS;
+
+    let (mut tokens, mut last_ns_out) = if earned > 0 {
+        let refilled = tokens_in.saturating_add(earned).min(TB_MAX_TOKENS);
+        (refilled, now_ns)
+    } else {
+        (tokens_in, last_ns)
+    };
+
+    if tokens == 0 {
+        return (false, tokens, last_ns_out); // XDP_DROP
+    }
+    tokens -= 1;
+    (true, tokens, last_ns_out)
+}
+
+/// Fresh session starts with a full burst bucket (512 tokens).
+/// First 512 packets should all be allowed.
+#[test]
+fn test_bucket_allows_initial_burst() {
+    let start_ns: u64 = 1_000_000_000; // arbitrary start
+    let mut tokens = TB_MAX_TOKENS;
+    let mut last_ns = start_ns;
+
+    for i in 0..TB_MAX_TOKENS {
+        // Packets arrive with 0 ms gap — no refill occurs
+        let (allowed, t, ln) = token_bucket_tick(start_ns, last_ns, tokens);
+        assert!(allowed, "Packet {} of burst should be allowed", i);
+        tokens = t;
+        last_ns = ln;
+    }
+    assert_eq!(tokens, 0, "Bucket must be empty after full burst");
+}
+
+/// After the burst is exhausted, next packet with no time elapsed is dropped.
+#[test]
+fn test_bucket_drops_when_empty() {
+    let start_ns: u64 = 2_000_000_000;
+    // Simulate bucket already exhausted
+    let (allowed, _t, _ln) = token_bucket_tick(start_ns, start_ns, 0);
+    assert!(!allowed, "Empty bucket must XDP_DROP the packet");
+}
+
+/// Waiting 5 ms should replenish exactly 5 tokens.
+#[test]
+fn test_bucket_refills_after_wait() {
+    let start_ns: u64 = 3_000_000_000;
+    let empty_tokens = 0u64;
+    // Simulate 5 ms elapsed
+    let now_ns = start_ns + 5 * TB_REFILL_NS;
+
+    let (allowed, tokens_out, _) = token_bucket_tick(now_ns, start_ns, empty_tokens);
+    // 5 tokens earned, 1 consumed → 4 remaining
+    assert!(allowed, "Packet after 5 ms wait should be allowed");
+    assert_eq!(tokens_out, 4, "Should have 4 tokens remaining after refill");
+}
+
+/// Bucket refill capped at MAX_TOKENS even after a very long idle period.
+#[test]
+fn test_bucket_caps_at_max_tokens() {
+    let start_ns: u64 = 4_000_000_000;
+    // 1 second elapsed → 1000 tokens earned, but capped at 512
+    let now_ns = start_ns + 1_000_000_000;
+    let (_allowed, tokens_out, _) = token_bucket_tick(now_ns, start_ns, 0);
+    // After consuming 1: expect MAX_TOKENS - 1 = 511
+    assert_eq!(
+        tokens_out,
+        TB_MAX_TOKENS - 1,
+        "Refill must be capped at MAX_TOKENS"
+    );
+}
+
+/// Simulates a spoofed-IP flood: 1000 consecutive packets with no time
+/// elapsed. Only the initial burst of 512 are passed; the rest are dropped.
+#[test]
+fn test_bucket_throttles_flood() {
+    let start_ns: u64 = 5_000_000_000;
+    let mut tokens = TB_MAX_TOKENS;
+    let mut last_ns = start_ns;
+    let mut passed = 0u64;
+    let mut dropped = 0u64;
+
+    for _ in 0..1000 {
+        let (allowed, t, ln) = token_bucket_tick(start_ns, last_ns, tokens);
+        if allowed {
+            passed += 1;
+        } else {
+            dropped += 1;
+        }
+        tokens = t;
+        last_ns = ln;
+    }
+
+    assert_eq!(passed, TB_MAX_TOKENS, "Only burst-cap packets should pass");
+    assert_eq!(
+        dropped,
+        1000 - TB_MAX_TOKENS,
+        "Remaining flood packets must be dropped"
+    );
+}

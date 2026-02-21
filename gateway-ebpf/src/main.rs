@@ -142,13 +142,39 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // Check if IP is currently authorized (QUIC traffic)
+    // ── Hot path: Token-Bucket rate limiter for authorized QUIC traffic ──────
+    // For every known-authorized IP, refill tokens based on elapsed kernel time,
+    // then deduct one token per packet. If the bucket is empty, XDP_DROP.
+    // This prevents spoofed-IP floods from consuming user-space quota.
     if let Some(user_id) = unsafe { ALLOW_LIST_MAP.get(&ipv4_source) } {
-        if let Some(auth_state) = unsafe { AUTH_STATE_MAP.get(user_id) } {
-            if auth_state.tokens > 0 {
-                return Ok(xdp_action::XDP_PASS);
-            }
+        let state_ptr = match unsafe { AUTH_STATE_MAP.get_ptr_mut(user_id) } {
+            Some(p) => p,
+            None => return Ok(xdp_action::XDP_DROP),
+        };
+
+        let mut st = unsafe { core::ptr::read_volatile(state_ptr) };
+
+        // Refill: compute elapsed ns since last refill, add earned tokens
+        let now_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+        let elapsed = now_ns.saturating_sub(st.last_refill_ns);
+        let earned = elapsed / AuthState::REFILL_INTERVAL_NS; // 1 token per 1 ms
+
+        if earned > 0 {
+            st.bucket_tokens = (st.bucket_tokens.saturating_add(earned)).min(AuthState::MAX_TOKENS);
+            st.last_refill_ns = now_ns;
         }
+
+        // Deduct one token for this packet
+        if st.bucket_tokens == 0 {
+            // Bucket empty → soft-drop flood traffic; state unchanged
+            return Ok(xdp_action::XDP_DROP);
+        }
+        st.bucket_tokens -= 1;
+
+        // Write updated state back
+        unsafe { core::ptr::write_volatile(state_ptr, st) };
+
+        return Ok(xdp_action::XDP_PASS); // Authorized and within rate limit
     }
 
     let udp_len = u16::from_be_bytes(unsafe { (*udphdr).len }) as usize;
@@ -220,7 +246,8 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 
     let mut match_ok = true;
     for i in 0..8 {
-        if current_hash[i] != auth_state.anchor_hash[i] {
+        let anchor_byte = ((auth_state.anchor_hash_lo >> (i * 8)) & 0xFF) as u8;
+        if current_hash[i] != anchor_byte {
             match_ok = false;
         }
     }
@@ -229,11 +256,18 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP); // Invalid Hash Preimage
     }
 
-    // 9. State Fast-Forward & IP Binding
+    // 9. State Fast-Forward & Bucket Bootstrap on first SPA accept
     auth_state.expected_seq = seq;
-    auth_state.anchor_hash = packet_hash;
-    // Set 1 initial token to allow QUIC connection to start. Quota actual value can be managed by userspace.
-    auth_state.tokens = 1;
+    auth_state.anchor_hash_lo = u64::from_le_bytes(packet_hash);
+
+    // Initialise the token bucket on the very first admission (last_refill_ns == 0)
+    // or replenish after a fresh knock (new QUIC session starting).
+    let now_ns = unsafe { aya_ebpf::helpers::bpf_ktime_get_ns() };
+    auth_state.bucket_tokens = AuthState::MAX_TOKENS; // full burst on connect
+    auth_state.last_refill_ns = now_ns;
+
+    // quota_bytes is set by userspace after the QUIC handshake (Phase 2);
+    // leave it untouched here so repeated SPA knocks don't reset the quota.
 
     // Atomically write back state
     unsafe { core::ptr::write_volatile(auth_state_ptr, auth_state) };
