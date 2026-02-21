@@ -111,6 +111,11 @@ async fn main() -> Result<()> {
     // Leak bpf to make it 'static — it must live for the duration of the process
     let bpf: &'static mut Ebpf = Box::leak(Box::new(bpf));
 
+    let allow_list_map: EbpfHashMap<_, u32, u64> = EbpfHashMap::try_from(
+        bpf.take_map("ALLOW_LIST_MAP")
+            .ok_or_else(|| anyhow::anyhow!("ALLOW_LIST_MAP not found"))?,
+    )?;
+
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
     // cgroup registration task independently.
     let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
@@ -201,8 +206,18 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Set up a channel so session handlers can signal new cgroup IDs to be registered
-    // in the AUDIT_CGROUP_MAP eBPF map. audit_cgroup_map is moved into this task.
+    let (allowlist_tx, mut allowlist_rx) = tokio::sync::mpsc::channel::<(u32, bool)>(64);
+    tokio::spawn(async move {
+        let mut map = allow_list_map;
+        while let Some((ip, add)) = allowlist_rx.recv().await {
+            if add {
+                let _ = map.insert(ip, u64::MAX, 0);
+            } else {
+                let _ = map.remove(&ip);
+            }
+        }
+    });
+
     let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, bool)>(64);
     tokio::spawn(async move {
         let mut cgroup_map = audit_cgroup_map;
@@ -226,8 +241,17 @@ async fn main() -> Result<()> {
     while let Some(conn) = endpoint.accept().await {
         let token_clone = Arc::clone(&token);
         let cgroup_tx_clone = cgroup_tx.clone();
+        let allowlist_tx_clone = allowlist_tx.clone();
         tokio::spawn(async move {
             let remote = conn.remote_address();
+            let client_ip = match remote {
+                SocketAddr::V4(v4) => u32::from_be_bytes(v4.ip().octets()),
+                _ => {
+                    tracing::warn!("Unsupported non-IPv4 client: {}", remote);
+                    return;
+                }
+            };
+
             tracing::info!("Connection initialized from {}", remote);
             let connection = match conn.await {
                 Ok(c) => c,
@@ -253,7 +277,15 @@ async fn main() -> Result<()> {
                 tracing::warn!("Client connected without identity (should be rejected by rustls)");
             }
 
-            if let Err(e) = handle_connection(connection, &token_clone, cgroup_tx_clone).await {
+            if let Err(e) = handle_connection(
+                connection,
+                &token_clone,
+                cgroup_tx_clone,
+                allowlist_tx_clone,
+                client_ip,
+            )
+            .await
+            {
                 tracing::error!("Connection error with {}: {:?}", remote, e);
             }
         });
@@ -324,6 +356,8 @@ async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
     cgroup_tx: tokio::sync::mpsc::Sender<(u64, bool)>,
+    allowlist_tx: tokio::sync::mpsc::Sender<(u32, bool)>,
+    client_ip: u32,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -337,6 +371,9 @@ async fn handle_connection(
         handshake.pty_size.rows,
         handshake.pty_size.cols
     );
+
+    // Make the XDP SPA bypass permanent for this session
+    allowlist_tx.send((client_ip, true)).await.ok();
 
     // 3. Prepare empty Session Cgroup FIRST
     static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -502,6 +539,9 @@ async fn handle_connection(
         tracing::info!("[AUDIT] Deactivating kernel probe for cgroup_id={}", cg.id);
         let _ = cgroup_tx.send((cg.id, false)).await;
     }
+
+    // Remove the permanent XDP bypass now that the connection is closed
+    let _ = allowlist_tx.send((client_ip, false)).await;
 
     Ok(())
 }

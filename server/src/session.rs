@@ -33,14 +33,20 @@ impl PtySession {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/proc/self/exe"));
         let mut cmd = CommandBuilder::new(exe);
 
+        for (key, val) in env_vars {
+            // Strict allowlist for environment variables to prevent LD_PRELOAD
+            // or other injection attacks before our Rust wrapper can join the Cgroup
+            if key == "TERM" || key == "LANG" || key == "COLORTERM" {
+                cmd.env(key, val);
+            } else {
+                tracing::warn!("Blocked malicious or unsupported env var: {}", key);
+            }
+        }
+
         if let Some(path) = cgroup_procs_path {
             cmd.env("INTERNAL_CGROUP_JOIN", path.to_string_lossy().as_ref());
         } else {
             cmd.env("INTERNAL_CGROUP_JOIN", "SKIP");
-        }
-
-        for (key, val) in env_vars {
-            cmd.env(key, val);
         }
 
         let child = pair.slave.spawn_command(cmd)?;
