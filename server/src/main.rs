@@ -465,6 +465,7 @@ async fn main() -> Result<()> {
             };
 
             let consumed_bytes = Arc::new(AtomicU64::new(0));
+            let synced_bytes = Arc::new(AtomicU64::new(0));
 
             if let Err(e) = handle_connection(
                 connection,
@@ -476,6 +477,7 @@ async fn main() -> Result<()> {
                 client_subject,
                 initial_quota,
                 consumed_bytes,
+                synced_bytes,
             )
             .await
             {
@@ -555,6 +557,7 @@ async fn handle_connection(
     client_subject: u32,
     initial_quota: u64,
     consumed_bytes: Arc<AtomicU64>,
+    synced_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -620,6 +623,7 @@ async fn handle_connection(
     let (from_pty_tx, mut from_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
 
     let to_pty_consumed = Arc::clone(&consumed_bytes);
+    let to_pty_synced = Arc::clone(&synced_bytes);
     let to_pty_auth_map = Arc::clone(&auth_state_map);
 
     // Task 1: QUIC Stream Recv -> to_pty_tx
@@ -648,6 +652,7 @@ async fn handle_connection(
                             state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
                             let _ = auth_map.insert(client_subject, state, 0);
                         }
+                        to_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
                         local_unreported = 0;
                     }
 
@@ -685,6 +690,7 @@ async fn handle_connection(
     });
 
     let from_pty_consumed = Arc::clone(&consumed_bytes);
+    let from_pty_synced = Arc::clone(&synced_bytes);
     let from_pty_auth_map = Arc::clone(&auth_state_map);
 
     // Task 4: from_pty_rx -> QUIC Stream Send
@@ -714,6 +720,7 @@ async fn handle_connection(
                     state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
                     let _ = auth_map.insert(client_subject, state, 0);
                 }
+                from_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
                 local_unreported = 0;
             }
         }
@@ -796,19 +803,22 @@ async fn handle_connection(
     // Flush final consumed bytes back to BPF map
     {
         let final_consumed = consumed_bytes.load(Ordering::Acquire);
-        let mut auth_map = auth_state_map.lock().await;
-        if let Ok(mut state) = auth_map.get(&client_subject, 0) {
-            if state.quota_bytes >= final_consumed {
-                state.quota_bytes -= final_consumed;
-            } else {
-                state.quota_bytes = 0;
+        let final_synced = synced_bytes.load(Ordering::Acquire);
+
+        let unsynced = final_consumed.saturating_sub(final_synced);
+
+        if unsynced > 0 {
+            let mut auth_map = auth_state_map.lock().await;
+            if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                state.quota_bytes = state.quota_bytes.saturating_sub(unsynced);
+                let _ = auth_map.insert(client_subject, state, 0);
+                tracing::info!(
+                    "Supervision: Synced final quota for {} (Unsynced tail: {}, Total Session Consumed: {})",
+                    client_subject,
+                    unsynced,
+                    final_consumed
+                );
             }
-            let _ = auth_map.insert(client_subject, state, 0);
-            tracing::info!(
-                "Supervision: Synced final quota for {} (Consumed: {})",
-                client_subject,
-                final_consumed
-            );
         }
     }
 
