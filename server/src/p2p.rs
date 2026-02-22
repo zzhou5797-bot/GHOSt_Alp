@@ -124,9 +124,9 @@ pub async fn run_p2p(
                                 let votes = slash_votes.entry(subject).or_default();
                                 votes.insert(peer_id);
 
-                                // BFT Slash Consensus (m >= 1 for localhost dev testing)
-                                if votes.len() >= 1 {
-                                    info!("BFT Threshold reached! Slashing DID {} permanently.", subject);
+                                // BFT Slash Consensus: Require at least 3 unique peer signatures to prevent Sybil attacks
+                                if votes.len() >= 3 {
+                                    info!("BFT Threshold (3) reached! Slashing DID {} permanently.", subject);
                                     let mut map = auth_state_map.lock().await;
                                     if let Ok(mut state) = map.get(&subject, 0) {
                                         state.revoked = 1;

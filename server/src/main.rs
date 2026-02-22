@@ -140,14 +140,28 @@ async fn main() -> Result<()> {
     // SAFETY: bpf is 'static; raw-ptr reborrows prevent lifetime overlap across map calls.
     let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
 
-    // ALLOW_LIST_MAP: IP → subject (u32). Shared between allowlist task and GC task.
-    let allow_list_map = Arc::new(tokio::sync::Mutex::new(
-        EbpfHashMap::<_, u32, u32>::try_from(
+    // ALLOW_LIST_MAP: client_ip (u32) → subject (u32)
+    let allow_list_map: Arc<tokio::sync::Mutex<EbpfHashMap<_, u32, u32>>> =
+        Arc::new(tokio::sync::Mutex::new(EbpfHashMap::try_from(
             unsafe { &mut *bpf_ptr }
-                .map_mut("ALLOW_LIST_MAP")
+                .take_map("ALLOW_LIST_MAP")
                 .ok_or_else(|| anyhow::anyhow!("ALLOW_LIST_MAP not found"))?,
-        )?,
-    ));
+        )?));
+
+    // Phase 5 State Reconciliation: Clear stale ALLOW_LIST_MAP IP bindings
+    // This prevents Ghost IP poisoning if the daemon previously crashed without
+    // cleanly unregistering QUIC connection leases.
+    {
+        let mut map = allow_list_map.lock().await;
+        let keys_to_delete: Vec<u32> = map.keys().filter_map(|k| k.ok()).collect();
+        for ip in keys_to_delete {
+            let _ = map.remove(&ip);
+            tracing::info!(
+                "State Reconciliation: Purged stale IP {} from ALLOW_LIST_MAP",
+                ip
+            );
+        }
+    }
 
     // AUTH_STATE_MAP: subject (u32) → AuthState. Shared between GC task only for now.
     let auth_state_map = Arc::new(tokio::sync::Mutex::new(
@@ -273,9 +287,13 @@ async fn main() -> Result<()> {
         let health_addr: SocketAddr = "0.0.0.0:8081".parse().unwrap();
         if let Ok(listener) = tokio::net::TcpListener::bind(health_addr).await {
             tracing::info!("Health probe listening on {}", health_addr);
+            // Limit K8s health probes to 10 concurrent connections to mitigate Slowloris / socket exhaustion
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let mut buf = [0; 128];
                         // Very simple HTTP check: Read the first few bytes and see if it looks like a GET request
                         if let Ok(Ok(n)) = tokio::time::timeout(
@@ -385,17 +403,15 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
 
-                // Collect current kernel monotonic ns via /proc/uptime (user-space equivalent)
-                // We use /proc/uptime to derive ktime_ns equivalent without entering kernel.
-                let ktime_ns: u64 = std::fs::read_to_string("/proc/uptime")
-                    .ok()
-                    .and_then(|s| {
-                        s.split_whitespace()
-                            .next()
-                            .and_then(|v| v.parse::<f64>().ok())
-                    })
-                    .map(|secs| (secs * 1_000_000_000.0) as u64)
-                    .unwrap_or(0);
+                // Collect current kernel monotonic ns via libc syscall (fail closed)
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                unsafe {
+                    libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+                }
+                let ktime_ns = (ts.tv_sec as u64 * 1_000_000_000) + ts.tv_nsec as u64;
 
                 // Collect subjects to evict
                 let mut to_evict: Vec<u32> = Vec::new();
@@ -492,17 +508,36 @@ async fn main() -> Result<()> {
                             cert.as_ref().len()
                         );
                         // Parse X.509 CN for DID Subject
-                        if let Ok((_, x509)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                        if let Ok((_, x509_parsed)) =
+                            x509_parser::parse_x509_certificate(cert.as_ref())
+                        {
+                            let x509 = x509_parsed;
+                            let mut dids_found = 0;
+                            let mut resolved_subject = None;
+
                             for subject in x509.subject().iter_common_name() {
+                                dids_found += 1;
                                 if let Ok(cn) = subject.attr_value().as_str() {
                                     if let Ok(parsed_subject) = cn.parse::<u32>() {
-                                        client_subject = parsed_subject;
-                                        tracing::info!(
-                                            "Resolved DID Subject from cert CN: {}",
-                                            client_subject
-                                        );
+                                        resolved_subject = Some(parsed_subject);
                                     }
                                 }
+                            }
+
+                            if dids_found > 1 {
+                                tracing::error!("Security Violation: Certificate contains multiple CNs. Rejecting DID hijacking attempt.");
+                                return; // Changed from continue to return to drop connection
+                            } else if dids_found == 0 {
+                                tracing::warn!("Authentication Failed: No valid CN found.");
+                                return; // Changed from continue to return to drop connection
+                            }
+
+                            if let Some(subject_id) = resolved_subject {
+                                client_subject = subject_id;
+                                tracing::info!(
+                                    "Resolved DID Subject from cert CN: {}",
+                                    client_subject
+                                );
                             }
                         }
                     }

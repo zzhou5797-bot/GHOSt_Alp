@@ -1,33 +1,64 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use indicatif::{ProgressBar, ProgressStyle};
 use quinn::{ClientConfig, Endpoint, TransportConfig};
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
 
+use clap::Subcommand;
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
+#[command(name = "ghost-cli", version, about = "Ghost Grid PTY Client", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Connect to a remote Ghost Grid gateway node
+    Connect(ConnectArgs),
+    /// (Phase 4.4) Connect to local daemon to stream TUI metrics
+    Ui,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct ConnectArgs {
+    /// The authorization token for the PTY session
+    #[arg(help = "Access Token")]
+    token: String,
+
+    /// Target DID (Decentralized Identifier) to map this session to
+    #[arg(short, long, help = "Target DID")]
+    target: u32,
+
+    /// Target Host IP/Domain
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
+    /// Target Port
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
 
+    /// Path to root CA certificate
     #[arg(long, default_value = "../certs/ca.crt")]
     ca: PathBuf,
 
+    /// Path to client certificate
     #[arg(long, default_value = "../certs/client.crt")]
     cert: PathBuf,
 
+    /// Path to client private key
     #[arg(long, default_value = "../certs/client.key")]
     key: PathBuf,
 
-    #[arg(long, env = "GATEWAY_TOKEN", default_value = "secret-token")]
-    token: String,
+    /// Allow insecure TLS connections (skip verification)
+    #[arg(long, default_value_t = false)]
+    insecure_skip_tls_verify: bool,
 
-    /// SipHash-2-4 shared secret (hex, 32 chars = 128-bit key).
+    // ── V2 Hash-Chain Configuration (Auto-managed if not specified) ──
     #[arg(
         long,
         env = "SPA_KEY",
@@ -35,9 +66,6 @@ struct Args {
     )]
     spa_key: String,
 
-    // ── V2 Hash-Chain fields ────────────────────────────────────────────
-    /// 32-hex-char seed for the hash chain (256-bit → first 8 bytes used).
-    /// The gateway administrator must pre-register `H_N` derived from this seed.
     #[arg(
         long,
         env = "SPA_SEED",
@@ -45,15 +73,9 @@ struct Args {
     )]
     seed: String,
 
-    /// Truncated DID / subject ID registered in AUTH_STATE_MAP on the gateway.
-    #[arg(long, env = "SPA_SUBJECT", default_value_t = 1)]
-    subject: u32,
-
-    /// File path that persists the current seq counter across restarts.
     #[arg(long, default_value = ".ghost_chain_state")]
     state_file: PathBuf,
 
-    /// Total length N of the hash chain. Chain is regenerated when exhausted.
     #[arg(long, default_value_t = 10000)]
     chain_depth: u64,
 }
@@ -187,8 +209,20 @@ fn get_hash_at_seq(seed: [u8; 8], seq: u64, k0: u64, k1: u64) -> [u8; 8] {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    tracing_subscriber::fmt::init();
 
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Connect(args) => run_connect(args).await,
+        Commands::Ui => {
+            println!("(Phase 4.4) UI attach mode requested. Not yet implemented.");
+            Ok(())
+        }
+    }
+}
+
+async fn run_connect(args: ConnectArgs) -> Result<()> {
     // Enable Raw Mode immediately for TTY feel
     enable_raw_mode()?;
 
@@ -203,69 +237,28 @@ async fn main() -> Result<()> {
 }
 
 /// Send a v1 (timestamp-based) SPA knock to `remote_addr` via `socket`.
-async fn send_spa_v1(
-    socket: &tokio::net::UdpSocket,
-    remote_addr: std::net::SocketAddr,
-    k0: u64,
-    k1: u64,
-) -> anyhow::Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("System time error")?
-        .as_nanos() as u64;
-    let sig = siphash24_16b(k0, k1, timestamp_ns >> 32, timestamp_ns & 0xFFFF_FFFF);
-    let mut payload = Vec::with_capacity(48);
-    payload.extend_from_slice(&0x5453_5054u32.to_be_bytes()); // magic
-    payload.extend_from_slice(&1u32.to_be_bytes()); // version = 1
-    payload.extend_from_slice(&0u32.to_be_bytes()); // pad
-    payload.extend_from_slice(&timestamp_ns.to_be_bytes());
-    payload.extend_from_slice(&sig);
-    payload.extend_from_slice(&[0u8; 24]);
-    socket
-        .send_to(&payload, remote_addr)
-        .await
-        .context("v1 SPA send failed")?;
-    Ok(())
-}
+// V1 SPA logic removed per Phase 5 security hardening
 
-/// Full v1 fallback: send v1 knock, wait 50 ms, connect QUIC, return connection.
-async fn try_v1_fallback(
-    endpoint: quinn::Endpoint,
-    remote_addr: std::net::SocketAddr,
-    spa_socket: &tokio::net::UdpSocket,
-    k0: u64,
-    k1: u64,
-    _token: &str,
-) -> anyhow::Result<quinn::Connection> {
-    send_spa_v1(spa_socket, remote_addr, k0, k1).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    eprintln!("QUIC: connecting via v1 fallback path...\r");
-    let conn = endpoint
-        .connect(remote_addr, "localhost")?
-        .await
-        .context("v1 fallback QUIC connect failed")?;
-    eprintln!("Connected (v1 legacy)!\r");
-    Ok(conn)
-}
-
-async fn run_client(args: Args) -> Result<()> {
+async fn setup_quic_client(args: &ConnectArgs, pb: &ProgressBar) -> Result<ClientConfig> {
     // 1. Load CA cert
+    if !args.ca.exists() {
+        pb.set_message(
+            "Warning: CA cert not found, continuing with insecure bypass if flag set...",
+        );
+    }
     let ca_cert_pem =
         fs::read(&args.ca).with_context(|| format!("Failed to read CA cert from {:?}", args.ca))?;
     let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
-    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut ca_cert_reader).collect::<Result<_, _>>()?;
-
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in ca_certs {
-        roots.add(cert)?;
-    }
 
     // 2. Load Client cert
     let cert_pem = fs::read(&args.cert)
         .with_context(|| format!("Failed to read client cert from {:?}", args.cert))?;
     let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
     let cert_chain = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    let cert = cert_chain
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No client certificate found"))?;
 
     // 3. Load Client key
     let key_pem = fs::read(&args.key)
@@ -275,26 +268,114 @@ async fn run_client(args: Args) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
 
     // 4. Configure TLS
-    let mut crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(cert_chain, priv_key)?;
+    if args.insecure_skip_tls_verify {
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_client_auth_cert(vec![cert], priv_key)?;
+        let mut config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+        ));
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        config.transport_config(Arc::new(transport));
+        Ok(config)
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        let ca_cert_pem = fs::read(&args.ca)
+            .with_context(|| format!("Failed to read CA cert from {:?}", args.ca))?;
+        let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
+        for cert in rustls_pemfile::certs(&mut ca_cert_reader).collect::<Result<Vec<_>, _>>()? {
+            roots.add(cert)?;
+        }
 
-    crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+        let crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![cert], priv_key)?;
 
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    ));
-    let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-    client_config.transport_config(Arc::new(transport));
+        let mut config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+        ));
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        config.transport_config(Arc::new(transport));
+        Ok(config)
+    }
+}
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config);
+// Insecure TLS verification for local tests
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
+    }
+}
+
+async fn run_client(args: ConnectArgs) -> Result<()> {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    // Setup QUIC Configuration
+    let quic_client_config = setup_quic_client(&args, &pb).await?;
+    let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+    endpoint.set_default_client_config(quic_client_config);
 
     let remote_addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .context("Invalid address")?;
 
+    // 0. V2: Generate Single Packet Auth (SPA) Knock
+    pb.set_message(format!("SPA Knocking {}:{}...", args.host, args.port));
     // ── V2 SPA: derive key material and hash chain position ─────────────────
     let secret_k0: u64 = if args.spa_key.len() == 32 {
         u64::from_str_radix(&args.spa_key[0..16], 16).unwrap_or(0x04030201efbeadde)
@@ -319,19 +400,22 @@ async fn run_client(args: Args) -> Result<()> {
         anyhow::bail!("Hash chain exhausted (seq=0). Re-register H_N with the gateway.");
     }
     let knock_hash = get_hash_at_seq(chain_seed, current_seq, secret_k0, secret_k1);
+    let subject_id = args.target; // P2P Gateway registered ID
     let next_seq = current_seq - 1;
     save_state(&args.state_file, chain_seed, next_seq)?;
     current_seq = next_seq;
-    let subject: u32 = args.subject;
-    eprintln!("Ghost Chain: seq={} remaining\r", current_seq);
+    pb.set_message(format!("Ghost Chain: seq={} remaining", current_seq));
 
-    eprintln!("SPA: sending v2 Hash Chain knock to {}...\r", remote_addr);
+    pb.set_message(format!(
+        "SPA: sending v2 Hash Chain knock to {}...",
+        remote_addr
+    ));
 
     // ── Assemble V2 SpaPayload (60 bytes) ────────────────────────────────────
     let mut v2_payload: Vec<u8> = Vec::with_capacity(60);
     v2_payload.extend_from_slice(&(0x5453_5054u32).to_be_bytes()); // magic
     v2_payload.extend_from_slice(&2u32.to_be_bytes()); // version
-    v2_payload.extend_from_slice(&subject.to_be_bytes());
+    v2_payload.extend_from_slice(&subject_id.to_be_bytes());
     v2_payload.extend_from_slice(&(current_seq + 1).to_be_bytes());
     v2_payload.extend_from_slice(&knock_hash);
     v2_payload.extend_from_slice(&[0u8; 32]); // signature placeholder
@@ -347,50 +431,26 @@ async fn run_client(args: Args) -> Result<()> {
     // Allow XDP map insertion to propagate (~50 ms)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // ── Attempt QUIC connect with short timeout (v2 path) ────────────────────
-    eprintln!("QUIC: connecting via v2 path to {}...\r", remote_addr);
-    let v2_fut = endpoint.connect(remote_addr, "localhost")?;
-    let connection = match tokio::time::timeout(std::time::Duration::from_millis(150), v2_fut).await
-    {
-        Ok(Ok(conn)) => {
-            eprintln!("Connected (v2 Hash Chain)!\r");
-            conn
-        }
-        Ok(Err(e)) => {
-            eprintln!("QUIC v2 connect error: {}. Falling back to v1...\r", e);
-            return try_v1_fallback(
-                endpoint,
-                remote_addr,
-                &spa_socket,
-                secret_k0,
-                secret_k1,
-                &args.token,
-            )
-            .await
-            .map(|_| ());
-        }
-        Err(_) => {
-            eprintln!("QUIC v2 timeout after 150ms. Sending v1 SPA knock + retry...\r");
-            send_spa_v1(&spa_socket, remote_addr, secret_k0, secret_k1).await?;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            eprintln!("QUIC: connecting via v1 fallback path...\r");
-            endpoint
-                .connect(remote_addr, "localhost")?
-                .await
-                .context("v1 fallback QUIC connect failed")?
-        }
-    };
+    // ── Attempt QUIC connect (v2 path only) ──────────────────────────────────
+    pb.set_message(format!("Establishing QUIC tunnel to {}...", remote_addr));
+    let connection = endpoint
+        .connect(remote_addr, "localhost")?
+        .await
+        .context("QUIC connect failed after v2 knock")?;
+    pb.finish_with_message("✓ Connected (v2 Hash Chain)!");
 
     // 1. Open Control Stream FIRST
     let mut control_tx = connection.open_uni().await?;
 
     // 2. Perform Handshake
     // A. Send Authenticate Token FIRST
+    pb.set_message("Exchanging PTY metadata...");
     let msg = shared::ControlMessage::Authenticate {
-        token: args.token,
+        token: args.token.clone(),
         genesis_vc: None,
     };
     send_control_msg(&mut control_tx, &msg).await?;
+    pb.finish_with_message("✓ Authorized as DID... Shell attached.");
 
     // B. Send TERM environment variable
     let term = std::env::var("TERM").unwrap_or("xterm-256color".into());
