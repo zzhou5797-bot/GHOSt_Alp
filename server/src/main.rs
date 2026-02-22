@@ -464,7 +464,6 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let shared_quota = Arc::new(AtomicU64::new(initial_quota));
             let consumed_bytes = Arc::new(AtomicU64::new(0));
 
             if let Err(e) = handle_connection(
@@ -475,7 +474,7 @@ async fn main() -> Result<()> {
                 auth_map_clone,
                 client_ip,
                 client_subject,
-                shared_quota,
+                initial_quota,
                 consumed_bytes,
             )
             .await
@@ -554,7 +553,7 @@ async fn handle_connection(
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
     client_subject: u32,
-    local_quota: Arc<AtomicU64>,
+    initial_quota: u64,
     consumed_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
@@ -620,8 +619,8 @@ async fn handle_connection(
     let (to_pty_tx, mut to_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let (from_pty_tx, mut from_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
 
-    let to_pty_quota = Arc::clone(&local_quota);
     let to_pty_consumed = Arc::clone(&consumed_bytes);
+    let to_pty_auth_map = Arc::clone(&auth_state_map);
 
     // Task 1: QUIC Stream Recv -> to_pty_tx
     tokio::spawn(async move {
@@ -630,39 +629,26 @@ async fn handle_connection(
         const SYNC_THRESHOLD: u64 = 65536; // 64KB
 
         loop {
-            // Check quota before read
-            let current_quota = to_pty_quota.load(Ordering::Acquire);
-            if current_quota == 0 {
-                tracing::warn!("Guillotine: Quota exhausted on Recv task");
-                break;
-            }
-
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
                     let bytes_read = n as u64;
                     local_unreported += bytes_read;
-                    to_pty_consumed.fetch_add(bytes_read, Ordering::Relaxed);
 
-                    // Sync to map / quota threshold
+                    let total_consumed =
+                        to_pty_consumed.fetch_add(bytes_read, Ordering::Relaxed) + bytes_read;
+
+                    if total_consumed > initial_quota {
+                        tracing::warn!("Guillotine: Quota exhausted on Recv task");
+                        break;
+                    }
+
                     if local_unreported >= SYNC_THRESHOLD {
-                        let mut q = to_pty_quota.load(Ordering::Acquire);
-                        let subtract = local_unreported;
-
-                        if q >= subtract {
-                            q -= subtract;
-                        } else {
-                            q = 0;
+                        let mut auth_map = to_pty_auth_map.lock().await;
+                        if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                            state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
+                            let _ = auth_map.insert(client_subject, state, 0);
                         }
-
-                        to_pty_quota.store(q, Ordering::Release);
                         local_unreported = 0;
-
-                        if q == 0 {
-                            tracing::warn!(
-                                "Guillotine: Quota exceeded SYNC_THRESHOLD limit on Recv task"
-                            );
-                            break;
-                        }
                     }
 
                     if to_pty_tx.send(buf[..n].to_vec()).await.is_err() {
@@ -698,8 +684,8 @@ async fn handle_connection(
         }
     });
 
-    let from_pty_quota = Arc::clone(&local_quota);
     let from_pty_consumed = Arc::clone(&consumed_bytes);
+    let from_pty_auth_map = Arc::clone(&auth_state_map);
 
     // Task 4: from_pty_rx -> QUIC Stream Send
     tokio::spawn(async move {
@@ -707,40 +693,28 @@ async fn handle_connection(
         const SYNC_THRESHOLD: u64 = 65536; // 64KB
 
         while let Some(data) = from_pty_rx.recv().await {
-            // Check quota before send
-            let current_quota = from_pty_quota.load(Ordering::Acquire);
-            if current_quota == 0 {
+            let len = data.len() as u64;
+
+            let total_consumed = from_pty_consumed.fetch_add(len, Ordering::Relaxed) + len;
+
+            if total_consumed > initial_quota {
                 tracing::warn!("Guillotine: Quota exhausted on Send task");
                 break;
             }
-
-            let len = data.len() as u64;
 
             if send.write_all(&data).await.is_err() {
                 break;
             }
 
             local_unreported += len;
-            from_pty_consumed.fetch_add(len, Ordering::Relaxed);
 
-            // Sync to map / quota threshold
             if local_unreported >= SYNC_THRESHOLD {
-                let mut q = from_pty_quota.load(Ordering::Acquire);
-                let subtract = local_unreported;
-
-                if q >= subtract {
-                    q -= subtract;
-                } else {
-                    q = 0;
+                let mut auth_map = from_pty_auth_map.lock().await;
+                if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                    state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
+                    let _ = auth_map.insert(client_subject, state, 0);
                 }
-
-                from_pty_quota.store(q, Ordering::Release);
                 local_unreported = 0;
-
-                if q == 0 {
-                    tracing::warn!("Guillotine: Quota exceeded SYNC_THRESHOLD limit on Send task");
-                    break;
-                }
             }
         }
         let _ = send.finish();
@@ -811,7 +785,7 @@ async fn handle_connection(
                  }
 
                  // C. Quota Guillotine Check (Fall-back)
-                 if local_quota.load(Ordering::Acquire) == 0 {
+                 if consumed_bytes.load(Ordering::Acquire) > initial_quota {
                      tracing::warn!("Supervision: Quota exhausted (Guillotine cut). Terminating session.");
                      break;
                  }
