@@ -202,7 +202,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-
 /// Send a v1 (timestamp-based) SPA knock to `remote_addr` via `socket`.
 async fn send_spa_v1(
     socket: &tokio::net::UdpSocket,
@@ -218,12 +217,15 @@ async fn send_spa_v1(
     let sig = siphash24_16b(k0, k1, timestamp_ns >> 32, timestamp_ns & 0xFFFF_FFFF);
     let mut payload = Vec::with_capacity(48);
     payload.extend_from_slice(&0x5453_5054u32.to_be_bytes()); // magic
-    payload.extend_from_slice(&1u32.to_be_bytes());           // version = 1
-    payload.extend_from_slice(&0u32.to_be_bytes());           // pad
+    payload.extend_from_slice(&1u32.to_be_bytes()); // version = 1
+    payload.extend_from_slice(&0u32.to_be_bytes()); // pad
     payload.extend_from_slice(&timestamp_ns.to_be_bytes());
     payload.extend_from_slice(&sig);
     payload.extend_from_slice(&[0u8; 24]);
-    socket.send_to(&payload, remote_addr).await.context("v1 SPA send failed")?;
+    socket
+        .send_to(&payload, remote_addr)
+        .await
+        .context("v1 SPA send failed")?;
     Ok(())
 }
 
@@ -296,14 +298,23 @@ async fn run_client(args: Args) -> Result<()> {
     // ── V2 SPA: derive key material and hash chain position ─────────────────
     let secret_k0: u64 = if args.spa_key.len() == 32 {
         u64::from_str_radix(&args.spa_key[0..16], 16).unwrap_or(0x04030201efbeadde)
-    } else { 0x04030201efbeadde };
+    } else {
+        0x04030201efbeadde
+    };
     let secret_k1: u64 = if args.spa_key.len() == 32 {
         u64::from_str_radix(&args.spa_key[16..32], 16).unwrap_or(0x0d0c0b0affe0dcba)
-    } else { 0x0d0c0b0affe0dcba };
-    let seed_hex = if args.seed.len() >= 16 { &args.seed[0..16] } else { "0102030405060708" };
+    } else {
+        0x0d0c0b0affe0dcba
+    };
+    let seed_hex = if args.seed.len() >= 16 {
+        &args.seed[0..16]
+    } else {
+        "0102030405060708"
+    };
     let seed_u64 = u64::from_str_radix(seed_hex, 16).unwrap_or(0x0102030405060708);
     let seed: [u8; 8] = seed_u64.to_le_bytes();
-    let (mut current_seq, chain_seed) = load_or_init_state(&args.state_file, seed, args.chain_depth)?;
+    let (mut current_seq, chain_seed) =
+        load_or_init_state(&args.state_file, seed, args.chain_depth)?;
     if current_seq == 0 {
         anyhow::bail!("Hash chain exhausted (seq=0). Re-register H_N with the gateway.");
     }
@@ -314,7 +325,7 @@ async fn run_client(args: Args) -> Result<()> {
     let subject: u32 = args.subject;
     eprintln!("Ghost Chain: seq={} remaining\r", current_seq);
 
-        eprintln!("SPA: sending v2 Hash Chain knock to {}...\r", remote_addr);
+    eprintln!("SPA: sending v2 Hash Chain knock to {}...\r", remote_addr);
 
     // ── Assemble V2 SpaPayload (60 bytes) ────────────────────────────────────
     let mut v2_payload: Vec<u8> = Vec::with_capacity(60);
@@ -339,10 +350,8 @@ async fn run_client(args: Args) -> Result<()> {
     // ── Attempt QUIC connect with short timeout (v2 path) ────────────────────
     eprintln!("QUIC: connecting via v2 path to {}...\r", remote_addr);
     let v2_fut = endpoint.connect(remote_addr, "localhost")?;
-    let connection = match tokio::time::timeout(
-        std::time::Duration::from_millis(150),
-        v2_fut,
-    ).await {
+    let connection = match tokio::time::timeout(std::time::Duration::from_millis(150), v2_fut).await
+    {
         Ok(Ok(conn)) => {
             eprintln!("Connected (v2 Hash Chain)!\r");
             conn
@@ -377,7 +386,10 @@ async fn run_client(args: Args) -> Result<()> {
 
     // 2. Perform Handshake
     // A. Send Authenticate Token FIRST
-    let msg = shared::ControlMessage::Authenticate { token: args.token };
+    let msg = shared::ControlMessage::Authenticate {
+        token: args.token,
+        genesis_vc: None,
+    };
     send_control_msg(&mut control_tx, &msg).await?;
 
     // B. Send TERM environment variable

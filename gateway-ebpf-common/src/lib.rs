@@ -55,6 +55,10 @@ pub struct AuthState {
     /// Remaining bytes of payload quota. Decremented by userspace after AEAD decrypt.
     /// When 0, userspace calls bpf_map_delete_elem to disconnect.
     pub quota_bytes: u64,
+
+    // ── 0-Day Immunity (Phase 3.3 & 3.4) ───────────────────────────────────
+    /// Slashed flag. When > 0, instantly drop all packets and kill connections.
+    pub revoked: u64,
 }
 
 impl AuthState {

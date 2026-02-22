@@ -161,13 +161,13 @@ fn handle_v1_knock(ctx: &XdpContext, payload_offset: usize, ipv4_source: u32) ->
     // Mark as seen (LRU evicts oldest entry automatically)
     let _ = unsafe { REPLAY_FILTER_MAP.insert(&timestamp_ns, &1u8, 0) };
 
-    // Bootstrap or refresh the shared V1_SUBJECT AuthState with 1 token
     let v1_auth = AuthState {
         expected_seq: 0,
         anchor_hash_lo: 0,
         bucket_tokens: 1, // One-shot: enough for the QUIC handshake
         last_refill_ns: ktime_ns,
         quota_bytes: 1_000_000_000, // 1 GiB default quota for legacy sessions
+        revoked: 0,
     };
     let _ = unsafe { AUTH_STATE_MAP.insert(&V1_SUBJECT, &v1_auth, 0) };
 
@@ -296,6 +296,11 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     };
 
     let mut auth_state = unsafe { core::ptr::read_volatile(auth_state_ptr) };
+
+    // ── Phase 3.3 & 3.4 0-Day Immunity ──────────────────────────────────────
+    if auth_state.revoked > 0 {
+        return Ok(xdp_action::XDP_DROP); // Subject is slashed, kill connection at NIC
+    }
 
     // 7. Hash Chain Sequence Validation
     if seq >= auth_state.expected_seq {
@@ -442,9 +447,4 @@ fn try_audit_execve(ctx: TracePointContext) -> Result<(), ()> {
 
     unsafe { AUDIT_EVENTS.output(&ctx, &event, 0) };
     Ok(())
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { core::hint::unreachable_unchecked() }
 }

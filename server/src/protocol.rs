@@ -7,6 +7,7 @@ use tokio::io::AsyncReadExt;
 pub struct HandshakeResult {
     pub pty_size: PtySize,
     pub env_vars: HashMap<String, String>,
+    pub genesis_vc: Option<shared::GenesisCredential>,
 }
 
 pub async fn perform_handshake(
@@ -20,6 +21,7 @@ pub async fn perform_handshake(
         pixel_width: 0,
         pixel_height: 0,
     };
+    let mut genesis_vc_out = None;
     let mut authenticated = false;
 
     let mut len_buf = [0u8; 4];
@@ -40,7 +42,7 @@ pub async fn perform_handshake(
                 if let Ok(msg) = serde_json::from_slice::<shared::ControlMessage>(&body) {
                     if !authenticated {
                         match msg {
-                            shared::ControlMessage::Authenticate { token } => {
+                            shared::ControlMessage::Authenticate { token, genesis_vc } => {
                                 let expected_bytes = expected_token.as_bytes();
                                 let provided_bytes = token.as_bytes();
 
@@ -60,6 +62,7 @@ pub async fn perform_handshake(
 
                                 if is_equal == 1 && bool::from(ct_result) {
                                     authenticated = true;
+                                    genesis_vc_out = genesis_vc;
                                     tracing::info!("Client authenticated successfully.");
                                 } else {
                                     tracing::warn!("Authentication failed: invalid token.");
@@ -102,5 +105,12 @@ pub async fn perform_handshake(
         }
     }
 
-    Ok((HandshakeResult { pty_size, env_vars }, control_rx))
+    Ok((
+        HandshakeResult {
+            pty_size,
+            env_vars,
+            genesis_vc: genesis_vc_out,
+        },
+        control_rx,
+    ))
 }

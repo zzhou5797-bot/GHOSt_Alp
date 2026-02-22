@@ -1,5 +1,7 @@
 mod cgroup;
 mod dataplane;
+mod genesis;
+mod p2p;
 mod protocol;
 mod session;
 
@@ -174,8 +176,27 @@ async fn main() -> Result<()> {
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
 
+    // ── Phase 3.3 0-Day Slash Tracker map ───────────────────────────────────
+    // Maps `cgroup_id` to its originating `client_subject` so that `audit_execve`
+    // anomalies can be traced back to the DID for P2P Slasher consensus.
+    let cgroup_to_subject: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, u32>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let audit_cgroup_tracker = Arc::clone(&cgroup_to_subject);
+    let manager_cgroup_tracker = Arc::clone(&cgroup_to_subject);
+
+    // ── Phase 3.1: Gossipsub P2P Swarm ──────────────────────────────────────────
+    let (p2p_tx, p2p_rx) = tokio::sync::mpsc::channel::<p2p::P2pMessage>(1024);
+    if let Ok(swarm) = p2p::build_swarm() {
+        tokio::spawn(p2p::run_p2p(swarm, Arc::clone(&auth_state_map), p2p_rx));
+        tracing::info!("Phase 3.1: Hybrid Gossipsub Control Plane initialized.");
+    } else {
+        tracing::error!("Failed to initialize P2P swarm. Gossipsub disabled.");
+    }
+
     for cpu_id in cpus {
         let mut buf = perf_array.open(cpu_id, None)?;
+        let cpu_tracker = Arc::clone(&audit_cgroup_tracker);
+        let cpu_p2p_tx = p2p_tx.clone();
         tokio::spawn(async move {
             let mut buffers: Vec<BytesMut> =
                 (0..10).map(|_| BytesMut::with_capacity(512)).collect();
@@ -211,6 +232,36 @@ async fn main() -> Result<()> {
                             filename,
                             args
                         );
+
+                        // ── 0-Day Anomaly Detection Heuristics ─────────────────
+                        let is_anomaly = filename.ends_with("/wget")
+                            || filename.ends_with("/curl")
+                            || filename.ends_with("/nc")
+                            || filename.ends_with("/nmap");
+
+                        if is_anomaly {
+                            tracing::error!("🚨 0-DAY HEURISTIC TRIPPED: Potential exploit payload downloader detected! ({})", filename);
+                            // Trace cgroup back to DID
+                            let tracker = cpu_tracker.lock().await;
+                            if let Some(&subject) = tracker.get(&event.cgroup_id) {
+                                drop(tracker); // Drop lock before async send
+                                tracing::error!(
+                                    "🛡️ Broadcasting P2P Slash Consensus vote against DID: {}",
+                                    subject
+                                );
+                                let _ = cpu_p2p_tx
+                                    .send(p2p::P2pMessage::Slash {
+                                        subject,
+                                        reason: format!(
+                                            "0-Day Heuristic: Remote Payload execution ({})",
+                                            filename
+                                        ),
+                                    })
+                                    .await;
+                            } else {
+                                tracing::warn!("0-Day triggered but no matching subject found for cgroup_id {}", event.cgroup_id);
+                            }
+                        }
                     }
                 }
             }
@@ -286,18 +337,24 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, bool)>(64);
+    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, u32, bool)>(64);
     tokio::spawn(async move {
         let mut cgroup_map = audit_cgroup_map;
-        while let Some((cgroup_id, add)) = cgroup_rx.recv().await {
+        while let Some((cgroup_id, subject, add)) = cgroup_rx.recv().await {
             if add {
                 let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
+                manager_cgroup_tracker
+                    .lock()
+                    .await
+                    .insert(cgroup_id, subject);
                 tracing::info!(
-                    "[AUDIT] Registered cgroup_id={} in AUDIT_CGROUP_MAP",
-                    cgroup_id
+                    "[AUDIT] Registered cgroup_id={} for DID={} in AUDIT_CGROUP_MAP",
+                    cgroup_id,
+                    subject
                 );
             } else {
                 let _ = cgroup_map.remove(&cgroup_id);
+                manager_cgroup_tracker.lock().await.remove(&cgroup_id);
                 tracing::info!(
                     "[AUDIT] Removed cgroup_id={} from AUDIT_CGROUP_MAP",
                     cgroup_id
@@ -396,11 +453,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Swarm init refactored safely above `AUDIT_EVENTS`.
+
     while let Some(conn) = endpoint.accept().await {
         let token_clone = Arc::clone(&token);
         let cgroup_tx_clone = cgroup_tx.clone();
         let allowlist_tx_clone = allowlist_tx.clone();
         let auth_map_clone = Arc::clone(&auth_state_map);
+        let p2p_tx_clone = p2p_tx.clone();
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -451,19 +511,6 @@ async fn main() -> Result<()> {
                 tracing::warn!("Client connected without identity (should be rejected by rustls)");
             }
 
-            // Fetch initial quota from AUTH_STATE_MAP to initialize Atomic limits
-            let initial_quota = {
-                let auth_map = auth_map_clone.lock().await;
-                match auth_map.get(&client_subject, 0) {
-                    Ok(state) => state.quota_bytes,
-                    Err(_) => {
-                        // If state missing somehow, default to 1GB or drop?
-                        // Usually pre-populated by SPA.
-                        10 * 1024 * 1024 // Fallback to 10MB just in case
-                    }
-                }
-            };
-
             let consumed_bytes = Arc::new(AtomicU64::new(0));
             let synced_bytes = Arc::new(AtomicU64::new(0));
 
@@ -475,9 +522,9 @@ async fn main() -> Result<()> {
                 auth_map_clone,
                 client_ip,
                 client_subject,
-                initial_quota,
                 consumed_bytes,
                 synced_bytes,
+                p2p_tx_clone,
             )
             .await
             {
@@ -550,14 +597,14 @@ fn configure_server(
 async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<(u64, bool)>,
+    cgroup_tx: tokio::sync::mpsc::Sender<(u64, u32, bool)>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
     client_subject: u32,
-    initial_quota: u64,
     consumed_bytes: Arc<AtomicU64>,
     synced_bytes: Arc<AtomicU64>,
+    p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -572,6 +619,62 @@ async fn handle_connection(
         handshake.pty_size.cols
     );
 
+    // Phase 3.2: Genesis Bootstrap
+    let initial_quota = {
+        let mut auth_map = auth_state_map.lock().await;
+        match auth_map.get(&client_subject, 0) {
+            Ok(state) => state.quota_bytes,
+            Err(_) => {
+                if let Some(vc) = &handshake.genesis_vc {
+                    if genesis::verify_genesis_credential(vc) && vc.subject == client_subject {
+                        tracing::info!(
+                            "Genesis Bootstrap: New client verified. Allocating {} bytes.",
+                            vc.request_quota
+                        );
+                        let state = AuthState {
+                            quota_bytes: vc.request_quota,
+                            bucket_tokens: 100,
+                            last_refill_ns: 0,
+                            expected_seq: 10000,
+                            anchor_hash_lo: 0,
+                            revoked: 0,
+                        };
+                        let _ = auth_map.insert(client_subject, state, 0);
+
+                        // Gossip Genesis
+                        let _ = p2p_tx
+                            .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
+                                client_subject,
+                                delta_consumed: 0,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64,
+                            }))
+                            .await;
+
+                        vc.request_quota
+                    } else {
+                        tracing::warn!(
+                            "Genesis Bootstrap failed: invalid VC signature or subject mismatch."
+                        );
+                        0
+                    }
+                } else {
+                    tracing::warn!(
+                        "No state for subject {} and no Genesis VC provided.",
+                        client_subject
+                    );
+                    0
+                }
+            }
+        }
+    };
+
+    if initial_quota == 0 {
+        return Err(anyhow::anyhow!("Zero quota. Connection rejected."));
+    }
+
     // Bind IP <-> subject in ALLOW_LIST_MAP and allow QUIC traffic
     allowlist_tx
         .send((client_ip, client_subject, true))
@@ -585,7 +688,7 @@ async fn handle_connection(
     let _session_cgroup = match cgroup::SessionCgroup::create_empty(&session_id) {
         Ok(cg) => {
             // Send cgroup_id to the main task to insert into AUDIT_CGROUP_MAP
-            cgroup_tx.send((cg.id, true)).await.ok();
+            cgroup_tx.send((cg.id, client_subject, true)).await.ok();
             tracing::info!("[AUDIT] Activated kernel probe for cgroup_id={}", cg.id);
             Some(cg)
         }
@@ -625,6 +728,7 @@ async fn handle_connection(
     let to_pty_consumed = Arc::clone(&consumed_bytes);
     let to_pty_synced = Arc::clone(&synced_bytes);
     let to_pty_auth_map = Arc::clone(&auth_state_map);
+    let to_pty_p2p_tx = p2p_tx.clone();
 
     // Task 1: QUIC Stream Recv -> to_pty_tx
     tokio::spawn(async move {
@@ -652,7 +756,18 @@ async fn handle_connection(
                             state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
                             let _ = auth_map.insert(client_subject, state, 0);
                         }
+                        drop(auth_map);
                         to_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
+                        let _ = to_pty_p2p_tx
+                            .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
+                                client_subject,
+                                delta_consumed: local_unreported,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as u64,
+                            }))
+                            .await;
                         local_unreported = 0;
                     }
 
@@ -692,6 +807,8 @@ async fn handle_connection(
     let from_pty_consumed = Arc::clone(&consumed_bytes);
     let from_pty_synced = Arc::clone(&synced_bytes);
     let from_pty_auth_map = Arc::clone(&auth_state_map);
+    let from_pty_p2p_tx = p2p_tx.clone();
+    let from_pty_p2p_tx = p2p_tx.clone();
 
     // Task 4: from_pty_rx -> QUIC Stream Send
     tokio::spawn(async move {
@@ -720,7 +837,18 @@ async fn handle_connection(
                     state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
                     let _ = auth_map.insert(client_subject, state, 0);
                 }
+                drop(auth_map);
                 from_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
+                let _ = from_pty_p2p_tx
+                    .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
+                        client_subject,
+                        delta_consumed: local_unreported,
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as u64,
+                    }))
+                    .await;
                 local_unreported = 0;
             }
         }
@@ -819,12 +947,23 @@ async fn handle_connection(
                     final_consumed
                 );
             }
+            drop(auth_map);
+            let _ = p2p_tx
+                .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
+                    client_subject,
+                    delta_consumed: unsynced,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64,
+                }))
+                .await;
         }
     }
 
     if let Some(cg) = _session_cgroup {
         tracing::info!("[AUDIT] Deactivating kernel probe for cgroup_id={}", cg.id);
-        let _ = cgroup_tx.send((cg.id, false)).await;
+        let _ = cgroup_tx.send((cg.id, client_subject, false)).await;
     }
 
     // Remove the IP binding when the session ends
