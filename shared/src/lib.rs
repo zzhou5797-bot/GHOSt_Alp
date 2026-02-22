@@ -7,6 +7,8 @@ pub struct GenesisCredential {
     pub subject: u32,
     pub request_quota: u64,
     pub pubkey_index: u8,
+    pub nonce: u64,
+    pub timestamp_ns: u64,
     pub signature_hex: String,
 }
 

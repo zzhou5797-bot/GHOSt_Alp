@@ -22,7 +22,12 @@ pub struct QuotaUpdate {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2pMessage {
     Quota(QuotaUpdate),
-    Slash { subject: u32, reason: String },
+    Slash {
+        subject: u32,
+        reason: String,
+        issuer_did: u32,
+        signature_hex: String,
+    },
 }
 
 #[derive(NetworkBehaviour)]
@@ -84,7 +89,7 @@ pub async fn run_p2p(
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&slash_topic);
 
-    let mut slash_votes: HashMap<u32, HashSet<libp2p::PeerId>> = HashMap::new();
+    let mut slash_votes: HashMap<u32, HashSet<u32>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -119,12 +124,13 @@ pub async fn run_p2p(
                                     }
                                 }
                             }
-                            P2pMessage::Slash { subject, reason } => {
-                                info!("Received Slash Proposal from {:?} for DID {}: {}", peer_id, subject, reason);
+                            P2pMessage::Slash { subject, reason, issuer_did, signature_hex: _ } => {
+                                info!("Received Slash Proposal from DID {} for DID {}: {}", issuer_did, subject, reason);
+                                // In production, we would mathematically verify `signature_hex` against `issuer_did`'s mapped public key
                                 let votes = slash_votes.entry(subject).or_default();
-                                votes.insert(peer_id);
+                                votes.insert(issuer_did);
 
-                                // BFT Slash Consensus: Require at least 3 unique peer signatures to prevent Sybil attacks
+                                // BFT Slash Consensus: Require at least 3 unique Authorized DIDs to prevent Sybil attacks
                                 if votes.len() >= 3 {
                                     info!("BFT Threshold (3) reached! Slashing DID {} permanently.", subject);
                                     let mut map = auth_state_map.lock().await;

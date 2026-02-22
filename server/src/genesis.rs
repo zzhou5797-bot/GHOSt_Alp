@@ -32,6 +32,9 @@ pub fn verify_genesis_credential(vc: &GenesisCredential) -> bool {
 
     let signature = Signature::from_bytes(&sig_bytes);
 
-    let msg = format!("{}:{}", vc.subject, vc.request_quota);
+    let msg = format!(
+        "{}:{}:{}:{}",
+        vc.subject, vc.request_quota, vc.nonce, vc.timestamp_ns
+    );
     verifying_key.verify(msg.as_bytes(), &signature).is_ok()
 }

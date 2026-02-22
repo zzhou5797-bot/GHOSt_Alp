@@ -190,6 +190,10 @@ async fn main() -> Result<()> {
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
 
+    // ── Phase 6.2 Genesis Replay Tracking ─────────────────────────────────
+    let used_nonces: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
     // ── Phase 3.3 0-Day Slash Tracker map ───────────────────────────────────
     // Maps `cgroup_id` to its originating `client_subject` so that `audit_execve`
     // anomalies can be traced back to the DID for P2P Slasher consensus.
@@ -270,6 +274,8 @@ async fn main() -> Result<()> {
                                             "0-Day Heuristic: Remote Payload execution ({})",
                                             filename
                                         ),
+                                        issuer_did: 0, // In dev, we use 0 to represent the local Node
+                                        signature_hex: "dev-signature".to_string(),
                                     })
                                     .await;
                             } else {
@@ -477,6 +483,7 @@ async fn main() -> Result<()> {
         let allowlist_tx_clone = allowlist_tx.clone();
         let auth_map_clone = Arc::clone(&auth_state_map);
         let p2p_tx_clone = p2p_tx.clone();
+        let used_nonces_clone = Arc::clone(&used_nonces);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -549,6 +556,8 @@ async fn main() -> Result<()> {
             let consumed_bytes = Arc::new(AtomicU64::new(0));
             let synced_bytes = Arc::new(AtomicU64::new(0));
 
+            let nonces_clone = Arc::clone(&used_nonces_clone);
+
             if let Err(e) = handle_connection(
                 connection,
                 &token_clone,
@@ -560,6 +569,7 @@ async fn main() -> Result<()> {
                 consumed_bytes,
                 synced_bytes,
                 p2p_tx_clone,
+                nonces_clone,
             )
             .await
             {
@@ -640,6 +650,7 @@ async fn handle_connection(
     consumed_bytes: Arc<AtomicU64>,
     synced_bytes: Arc<AtomicU64>,
     p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
+    used_nonces: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -661,7 +672,26 @@ async fn handle_connection(
             Ok(state) => state.quota_bytes,
             Err(_) => {
                 if let Some(vc) = &handshake.genesis_vc {
-                    if genesis::verify_genesis_credential(vc) && vc.subject == client_subject {
+                    let now_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as u64;
+                    let time_diff = if now_ns > vc.timestamp_ns {
+                        now_ns - vc.timestamp_ns
+                    } else {
+                        vc.timestamp_ns - now_ns
+                    };
+
+                    let mut nonces = used_nonces.lock().await;
+
+                    if time_diff > 300_000_000_000 {
+                        tracing::warn!("Genesis Bootstrap failed: timestamp out of 300s window.");
+                        0
+                    } else if !nonces.insert(vc.nonce) {
+                        tracing::warn!("Genesis Bootstrap failed: nonce already used.");
+                        0
+                    } else if genesis::verify_genesis_credential(vc) && vc.subject == client_subject
+                    {
                         tracing::info!(
                             "Genesis Bootstrap: New client verified. Allocating {} bytes.",
                             vc.request_quota
@@ -775,23 +805,27 @@ async fn handle_connection(
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
                     let bytes_read = n as u64;
-                    local_unreported += bytes_read;
 
-                    let total_consumed =
-                        to_pty_consumed.fetch_add(bytes_read, Ordering::Relaxed) + bytes_read;
+                    let mut auth_map = to_pty_auth_map.lock().await;
+                    let mut quota_exhausted = false;
+                    if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                        if state.quota_bytes < bytes_read {
+                            state.quota_bytes = 0;
+                            quota_exhausted = true;
+                        } else {
+                            state.quota_bytes -= bytes_read;
+                        }
+                        let _ = auth_map.insert(client_subject, state, 0);
+                    }
+                    drop(auth_map);
 
-                    if total_consumed > initial_quota {
-                        tracing::warn!("Guillotine: Quota exhausted on Recv task");
+                    if quota_exhausted {
+                        tracing::warn!("Guillotine: Quota exhausted on Recv task (Atomic Cut)");
                         break;
                     }
 
+                    local_unreported += bytes_read;
                     if local_unreported >= SYNC_THRESHOLD {
-                        let mut auth_map = to_pty_auth_map.lock().await;
-                        if let Ok(mut state) = auth_map.get(&client_subject, 0) {
-                            state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
-                            let _ = auth_map.insert(client_subject, state, 0);
-                        }
-                        drop(auth_map);
                         to_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
                         let _ = to_pty_p2p_tx
                             .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
@@ -853,10 +887,21 @@ async fn handle_connection(
         while let Some(data) = from_pty_rx.recv().await {
             let len = data.len() as u64;
 
-            let total_consumed = from_pty_consumed.fetch_add(len, Ordering::Relaxed) + len;
+            let mut auth_map = from_pty_auth_map.lock().await;
+            let mut quota_exhausted = false;
+            if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                if state.quota_bytes < len {
+                    state.quota_bytes = 0;
+                    quota_exhausted = true;
+                } else {
+                    state.quota_bytes -= len;
+                }
+                let _ = auth_map.insert(client_subject, state, 0);
+            }
+            drop(auth_map);
 
-            if total_consumed > initial_quota {
-                tracing::warn!("Guillotine: Quota exhausted on Send task");
+            if quota_exhausted {
+                tracing::warn!("Guillotine: Quota exhausted on Send task (Atomic Cut)");
                 break;
             }
 
@@ -867,12 +912,6 @@ async fn handle_connection(
             local_unreported += len;
 
             if local_unreported >= SYNC_THRESHOLD {
-                let mut auth_map = from_pty_auth_map.lock().await;
-                if let Ok(mut state) = auth_map.get(&client_subject, 0) {
-                    state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
-                    let _ = auth_map.insert(client_subject, state, 0);
-                }
-                drop(auth_map);
                 from_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
                 let _ = from_pty_p2p_tx
                     .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
