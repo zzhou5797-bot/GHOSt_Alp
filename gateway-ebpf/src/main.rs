@@ -166,8 +166,9 @@ fn handle_v1_knock(ctx: &XdpContext, payload_offset: usize, ipv4_source: u32) ->
         anchor_hash_lo: 0,
         bucket_tokens: 1, // One-shot: enough for the QUIC handshake
         last_refill_ns: ktime_ns,
-        quota_bytes: 1_000_000_000, // 1 GiB default quota for legacy sessions
-        revoked: 0,
+        quota_bytes: 1_000_000_000,
+        last_seen_quota_seq: 0,
+        revoked: 0, // 1 GiB default quota for legacy sessions
     };
     let _ = unsafe { AUTH_STATE_MAP.insert(&V1_SUBJECT, &v1_auth, 0) };
 

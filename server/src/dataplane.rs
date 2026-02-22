@@ -75,6 +75,7 @@ impl DataPlaneEngine for EbpfDataPlane {
                         bucket_tokens: AuthState::MAX_TOKENS,
                         last_refill_ns: 0,
                         quota_bytes: 10_000_000_000, // 10 GiB default
+                        last_seen_quota_seq: 0,
                         revoked: 0,
                     };
                     let _ = m.insert(subject, initial, 0);

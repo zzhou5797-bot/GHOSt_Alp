@@ -191,11 +191,8 @@ async fn main() -> Result<()> {
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
 
-    // ── Phase 6.2 Genesis Replay Tracking ─────────────────────────────────
-    let used_nonces: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>> =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-
-    // ── Phase 3.3 0-Day Slash Tracker map ───────────────────────────────────
+    // ── Phase 6.2 Genesis Replay Tracking (Removed in Phase 7.3) ──────────
+    // used_nonces cache has been eradicated to prevent OOM vulnerabilities.
     // Maps `cgroup_id` to its originating `client_subject` so that `audit_execve`
     // anomalies can be traced back to the DID for P2P Slasher consensus.
     let cgroup_to_subject: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, u32>>> =
@@ -216,6 +213,7 @@ async fn main() -> Result<()> {
         let mut buf = perf_array.open(cpu_id, None)?;
         let cpu_tracker = Arc::clone(&audit_cgroup_tracker);
         let cpu_p2p_tx = p2p_tx.clone();
+        let cpu_auth_map = Arc::clone(&auth_state_map);
         tokio::spawn(async move {
             let mut buffers: Vec<BytesMut> =
                 (0..10).map(|_| BytesMut::with_capacity(512)).collect();
@@ -281,12 +279,22 @@ async fn main() -> Result<()> {
                                     subject
                                 );
 
+                                // Extract the subject's logical sequence
+                                let target_sequence = {
+                                    let mut map = cpu_auth_map.lock().await;
+                                    if let Ok(state) = map.get(&subject, 0) {
+                                        state.last_seen_quota_seq
+                                    } else {
+                                        0
+                                    }
+                                };
+
                                 // Cryptographically Sign the Slash Action using Node's Private Key
                                 let dev_priv_hex = "7f39668096feb9fa23d09163759902043192f4800410aea9cc6fc3b331bcfdec";
                                 let mut priv_bytes = [0u8; 32];
                                 hex::decode_to_slice(dev_priv_hex, &mut priv_bytes).unwrap();
                                 let signing_key = SigningKey::from_bytes(&priv_bytes);
-                                let msg = format!("slash:{}:0", subject);
+                                let msg = format!("slash:{}:{}", subject, target_sequence);
                                 let signature = signing_key.sign(msg.as_bytes());
                                 let signature_hex = hex::encode(signature.to_bytes());
 
@@ -299,11 +307,21 @@ async fn main() -> Result<()> {
                                         ),
                                         issuer_did: 0, // Dev Node represents ID 0
                                         signature_hex,
+                                        target_sequence,
                                     })
                                     .await;
                             } else {
                                 tracing::warn!("0-Day triggered but no matching subject found for cgroup_id {}", event.cgroup_id);
                             }
+                        } else {
+                            // Phase 6.3: Vanity Display Logic / Legacy Hooks
+                            // Provide an isolated observation hook for "vanity" operations that
+                            // don't trigger protocol slashes but look cool on the Dashboard.
+                            tracing::debug!(
+                                "VANITY_HOOK: Legitimate execution recognized: {} {}",
+                                filename,
+                                args
+                            );
                         }
                     }
                 }
@@ -506,7 +524,6 @@ async fn main() -> Result<()> {
         let allowlist_tx_clone = allowlist_tx.clone();
         let auth_map_clone = Arc::clone(&auth_state_map);
         let p2p_tx_clone = p2p_tx.clone();
-        let used_nonces_clone = Arc::clone(&used_nonces);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -578,8 +595,7 @@ async fn main() -> Result<()> {
 
             let consumed_bytes = Arc::new(AtomicU64::new(0));
             let synced_bytes = Arc::new(AtomicU64::new(0));
-
-            let nonces_clone = Arc::clone(&used_nonces_clone);
+            let quota_seq = Arc::new(AtomicU64::new(1));
 
             if let Err(e) = handle_connection(
                 connection,
@@ -591,8 +607,8 @@ async fn main() -> Result<()> {
                 client_subject,
                 consumed_bytes,
                 synced_bytes,
+                quota_seq,
                 p2p_tx_clone,
-                nonces_clone,
             )
             .await
             {
@@ -672,8 +688,8 @@ async fn handle_connection(
     client_subject: u32,
     consumed_bytes: Arc<AtomicU64>,
     synced_bytes: Arc<AtomicU64>,
+    quota_seq: Arc<AtomicU64>,
     p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
-    used_nonces: Arc<tokio::sync::Mutex<std::collections::HashSet<u64>>>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -695,26 +711,8 @@ async fn handle_connection(
             Ok(state) => state.quota_bytes,
             Err(_) => {
                 if let Some(vc) = &handshake.genesis_vc {
-                    let now_ns = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64;
-                    let time_diff = if now_ns > vc.timestamp_ns {
-                        now_ns - vc.timestamp_ns
-                    } else {
-                        vc.timestamp_ns - now_ns
-                    };
-
-                    let mut nonces = used_nonces.lock().await;
-
-                    if time_diff > 300_000_000_000 {
-                        tracing::warn!("Genesis Bootstrap failed: timestamp out of 300s window.");
-                        0
-                    } else if !nonces.insert(vc.nonce) {
-                        tracing::warn!("Genesis Bootstrap failed: nonce already used.");
-                        0
-                    } else if genesis::verify_genesis_credential(vc) && vc.subject == client_subject
-                    {
+                    // Phase 7.3: Timeless Anchor Hash Validation
+                    if genesis::verify_genesis_credential(vc) && vc.subject == client_subject {
                         tracing::info!(
                             "Genesis Bootstrap: New client verified. Allocating {} bytes.",
                             vc.request_quota
@@ -725,6 +723,7 @@ async fn handle_connection(
                             last_refill_ns: 0,
                             expected_seq: 10000,
                             anchor_hash_lo: 0,
+                            last_seen_quota_seq: 0,
                             revoked: 0,
                         };
                         let _ = auth_map.insert(client_subject, state, 0);
@@ -734,10 +733,7 @@ async fn handle_connection(
                             .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                                 client_subject,
                                 delta_consumed: 0,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_nanos() as u64,
+                                sequence_number: quota_seq.fetch_add(1, Ordering::Relaxed),
                             }))
                             .await;
 
@@ -816,6 +812,7 @@ async fn handle_connection(
     let to_pty_consumed = Arc::clone(&consumed_bytes);
     let to_pty_synced = Arc::clone(&synced_bytes);
     let to_pty_auth_map = Arc::clone(&auth_state_map);
+    let to_pty_quota_seq = Arc::clone(&quota_seq);
     let to_pty_p2p_tx = p2p_tx.clone();
 
     // Task 1: QUIC Stream Recv -> to_pty_tx
@@ -854,10 +851,7 @@ async fn handle_connection(
                             .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                                 client_subject,
                                 delta_consumed: local_unreported,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_nanos() as u64,
+                                sequence_number: to_pty_quota_seq.fetch_add(1, Ordering::Relaxed),
                             }))
                             .await;
                         local_unreported = 0;
@@ -899,7 +893,7 @@ async fn handle_connection(
     let from_pty_consumed = Arc::clone(&consumed_bytes);
     let from_pty_synced = Arc::clone(&synced_bytes);
     let from_pty_auth_map = Arc::clone(&auth_state_map);
-    let from_pty_p2p_tx = p2p_tx.clone();
+    let from_pty_quota_seq = Arc::clone(&quota_seq);
     let from_pty_p2p_tx = p2p_tx.clone();
 
     // Task 4: from_pty_rx -> QUIC Stream Send
@@ -940,10 +934,7 @@ async fn handle_connection(
                     .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                         client_subject,
                         delta_consumed: local_unreported,
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos() as u64,
+                        sequence_number: from_pty_quota_seq.fetch_add(1, Ordering::Relaxed),
                     }))
                     .await;
                 local_unreported = 0;
@@ -1049,10 +1040,7 @@ async fn handle_connection(
                 .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                     client_subject,
                     delta_consumed: unsynced,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos() as u64,
+                    sequence_number: quota_seq.fetch_add(1, Ordering::Relaxed),
                 }))
                 .await;
         }

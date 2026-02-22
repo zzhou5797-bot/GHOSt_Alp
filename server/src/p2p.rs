@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub struct QuotaUpdate {
     pub client_subject: u32,
     pub delta_consumed: u64,
-    pub timestamp: u64,
+    pub sequence_number: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -27,6 +27,7 @@ pub enum P2pMessage {
         reason: String,
         issuer_did: u32,
         signature_hex: String,
+        target_sequence: u64,
     },
 }
 
@@ -89,7 +90,7 @@ pub async fn run_p2p(
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&slash_topic);
 
-    let mut slash_votes: HashMap<u32, HashSet<u32>> = HashMap::new();
+    let mut slash_votes: HashMap<(u32, u64), HashSet<u32>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -118,14 +119,15 @@ pub async fn run_p2p(
                                 info!("Received Gossip Quota Update for DID {}: {} bytes", update.client_subject, update.delta_consumed);
                                 let mut map = auth_state_map.lock().await;
                                 if let Ok(mut state) = map.get(&update.client_subject, 0) {
-                                    if update.timestamp > state.last_refill_ns {
+                                    if update.sequence_number > state.last_seen_quota_seq {
                                         state.quota_bytes = state.quota_bytes.saturating_sub(update.delta_consumed);
+                                        state.last_seen_quota_seq = update.sequence_number;
                                         let _ = map.insert(update.client_subject, state, 0);
                                     }
                                 }
                             }
-                            P2pMessage::Slash { subject, reason, issuer_did, signature_hex } => {
-                                info!("Received Slash Proposal from DID {} for DID {}: {}", issuer_did, subject, reason);
+                            P2pMessage::Slash { subject, reason, issuer_did, signature_hex, target_sequence } => {
+                                info!("Received Slash Proposal from DID {} for DID {}: {} (Seq {})", issuer_did, subject, reason, target_sequence);
 
                                 // Phase 6.2: Sybil Threshold Cryptographic Check
                                 if !crate::genesis::verify_slash_signature(subject, issuer_did, &signature_hex) {
@@ -133,16 +135,21 @@ pub async fn run_p2p(
                                     continue;
                                 }
 
-                                let votes = slash_votes.entry(subject).or_default();
+                                let votes = slash_votes.entry((subject, target_sequence)).or_default();
                                 votes.insert(issuer_did);
 
                                 // BFT Slash Consensus: Require at least 3 unique Authorized DIDs to prevent Sybil attacks
                                 if votes.len() >= 3 {
-                                    info!("BFT Threshold (3) reached! Slashing DID {} permanently.", subject);
+                                    info!("BFT Threshold (3) reached! Slashing DID {} permanently at seq {}.", subject, target_sequence);
                                     let mut map = auth_state_map.lock().await;
                                     if let Ok(mut state) = map.get(&subject, 0) {
-                                        state.revoked = 1;
-                                        let _ = map.insert(subject, state, 0);
+                                        // Auto-expire legacy misvotes by only honoring the slash if the state's seq matches or is closely tracking the vote
+                                        if state.last_seen_quota_seq <= target_sequence || state.last_seen_quota_seq == 0 {
+                                            state.revoked = 1;
+                                            let _ = map.insert(subject, state, 0);
+                                        } else {
+                                            info!("BFT Threshold reached but ignored: Target seq {} is older than actual seq {}.", target_sequence, state.last_seen_quota_seq);
+                                        }
                                     }
                                 }
                             }

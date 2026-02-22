@@ -57,9 +57,11 @@ pub fn verify_genesis_credential(vc: &GenesisCredential) -> bool {
 
     let signature = Signature::from_bytes(&sig_bytes);
 
-    let msg = format!(
-        "{}:{}:{}:{}",
-        vc.subject, vc.request_quota, vc.nonce, vc.timestamp_ns
-    );
+    let mut anchor_hex = String::new();
+    for byte in &vc.anchor_hash {
+        anchor_hex.push_str(&format!("{:02x}", byte));
+    }
+
+    let msg = format!("{}:{}:{}", vc.subject, vc.request_quota, anchor_hex);
     verifying_key.verify(msg.as_bytes(), &signature).is_ok()
 }
