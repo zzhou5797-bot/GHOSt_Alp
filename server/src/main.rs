@@ -13,7 +13,13 @@ use bytes::BytesMut;
 use clap::Parser;
 use gateway_ebpf_common::{AuditEvent, AuthState};
 use quinn::{Endpoint, ServerConfig};
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
@@ -132,7 +138,6 @@ async fn main() -> Result<()> {
     // SAFETY: bpf is 'static; raw-ptr reborrows prevent lifetime overlap across map calls.
     let bpf_ptr: *mut Ebpf = bpf as *mut Ebpf;
 
-    // ── Shared eBPF maps (map_mut — shareable via Arc<Mutex<>>) ─────────────────────
     // ALLOW_LIST_MAP: IP → subject (u32). Shared between allowlist task and GC task.
     let allow_list_map = Arc::new(tokio::sync::Mutex::new(
         EbpfHashMap::<_, u32, u32>::try_from(
@@ -146,7 +151,7 @@ async fn main() -> Result<()> {
     let auth_state_map = Arc::new(tokio::sync::Mutex::new(
         EbpfHashMap::<_, u32, AuthState>::try_from(
             unsafe { &mut *bpf_ptr }
-                .map_mut("AUTH_STATE_MAP")
+                .take_map("AUTH_STATE_MAP")
                 .ok_or_else(|| anyhow::anyhow!("AUTH_STATE_MAP not found"))?,
         )?,
     ));
@@ -395,6 +400,7 @@ async fn main() -> Result<()> {
         let token_clone = Arc::clone(&token);
         let cgroup_tx_clone = cgroup_tx.clone();
         let allowlist_tx_clone = allowlist_tx.clone();
+        let auth_map_clone = Arc::clone(&auth_state_map);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -414,7 +420,8 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Log Client Auth Info
+            // Log Client Auth Info and Parse DID Subject
+            let mut client_subject = 1; // Fallback
             if let Some(identity) = connection.peer_identity() {
                 if let Some(certs) =
                     identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer>>()
@@ -424,19 +431,52 @@ async fn main() -> Result<()> {
                             "Client authenticated with cert size: {} bytes",
                             cert.as_ref().len()
                         );
+                        // Parse X.509 CN for DID Subject
+                        if let Ok((_, x509)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                            for subject in x509.subject().iter_common_name() {
+                                if let Ok(cn) = subject.attr_value().as_str() {
+                                    if let Ok(parsed_subject) = cn.parse::<u32>() {
+                                        client_subject = parsed_subject;
+                                        tracing::info!(
+                                            "Resolved DID Subject from cert CN: {}",
+                                            client_subject
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             } else {
                 tracing::warn!("Client connected without identity (should be rejected by rustls)");
             }
 
+            // Fetch initial quota from AUTH_STATE_MAP to initialize Atomic limits
+            let initial_quota = {
+                let auth_map = auth_map_clone.lock().await;
+                match auth_map.get(&client_subject, 0) {
+                    Ok(state) => state.quota_bytes,
+                    Err(_) => {
+                        // If state missing somehow, default to 1GB or drop?
+                        // Usually pre-populated by SPA.
+                        10 * 1024 * 1024 // Fallback to 10MB just in case
+                    }
+                }
+            };
+
+            let shared_quota = Arc::new(AtomicU64::new(initial_quota));
+            let consumed_bytes = Arc::new(AtomicU64::new(0));
+
             if let Err(e) = handle_connection(
                 connection,
                 &token_clone,
                 cgroup_tx_clone,
                 allowlist_tx_clone,
+                auth_map_clone,
                 client_ip,
-                1, // TODO(M3): resolve DID subject from mTLS cert CN
+                client_subject,
+                shared_quota,
+                consumed_bytes,
             )
             .await
             {
@@ -511,8 +551,11 @@ async fn handle_connection(
     expected_token: &str,
     cgroup_tx: tokio::sync::mpsc::Sender<(u64, bool)>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
+    auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
     client_subject: u32,
+    local_quota: Arc<AtomicU64>,
+    consumed_bytes: Arc<AtomicU64>,
 ) -> Result<()> {
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
@@ -577,12 +620,51 @@ async fn handle_connection(
     let (to_pty_tx, mut to_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let (from_pty_tx, mut from_pty_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
 
+    let to_pty_quota = Arc::clone(&local_quota);
+    let to_pty_consumed = Arc::clone(&consumed_bytes);
+
     // Task 1: QUIC Stream Recv -> to_pty_tx
     tokio::spawn(async move {
         let mut buf = [0u8; 1024];
+        let mut local_unreported = 0u64;
+        const SYNC_THRESHOLD: u64 = 65536; // 64KB
+
         loop {
+            // Check quota before read
+            let current_quota = to_pty_quota.load(Ordering::Acquire);
+            if current_quota == 0 {
+                tracing::warn!("Guillotine: Quota exhausted on Recv task");
+                break;
+            }
+
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
+                    let bytes_read = n as u64;
+                    local_unreported += bytes_read;
+                    to_pty_consumed.fetch_add(bytes_read, Ordering::Relaxed);
+
+                    // Sync to map / quota threshold
+                    if local_unreported >= SYNC_THRESHOLD {
+                        let mut q = to_pty_quota.load(Ordering::Acquire);
+                        let subtract = local_unreported;
+
+                        if q >= subtract {
+                            q -= subtract;
+                        } else {
+                            q = 0;
+                        }
+
+                        to_pty_quota.store(q, Ordering::Release);
+                        local_unreported = 0;
+
+                        if q == 0 {
+                            tracing::warn!(
+                                "Guillotine: Quota exceeded SYNC_THRESHOLD limit on Recv task"
+                            );
+                            break;
+                        }
+                    }
+
                     if to_pty_tx.send(buf[..n].to_vec()).await.is_err() {
                         break;
                     }
@@ -616,11 +698,49 @@ async fn handle_connection(
         }
     });
 
+    let from_pty_quota = Arc::clone(&local_quota);
+    let from_pty_consumed = Arc::clone(&consumed_bytes);
+
     // Task 4: from_pty_rx -> QUIC Stream Send
     tokio::spawn(async move {
+        let mut local_unreported = 0u64;
+        const SYNC_THRESHOLD: u64 = 65536; // 64KB
+
         while let Some(data) = from_pty_rx.recv().await {
+            // Check quota before send
+            let current_quota = from_pty_quota.load(Ordering::Acquire);
+            if current_quota == 0 {
+                tracing::warn!("Guillotine: Quota exhausted on Send task");
+                break;
+            }
+
+            let len = data.len() as u64;
+
             if send.write_all(&data).await.is_err() {
                 break;
+            }
+
+            local_unreported += len;
+            from_pty_consumed.fetch_add(len, Ordering::Relaxed);
+
+            // Sync to map / quota threshold
+            if local_unreported >= SYNC_THRESHOLD {
+                let mut q = from_pty_quota.load(Ordering::Acquire);
+                let subtract = local_unreported;
+
+                if q >= subtract {
+                    q -= subtract;
+                } else {
+                    q = 0;
+                }
+
+                from_pty_quota.store(q, Ordering::Release);
+                local_unreported = 0;
+
+                if q == 0 {
+                    tracing::warn!("Guillotine: Quota exceeded SYNC_THRESHOLD limit on Send task");
+                    break;
+                }
             }
         }
         let _ = send.finish();
@@ -689,7 +809,32 @@ async fn handle_connection(
                      tracing::info!("Supervision: Shell exited with status: {:?}", status);
                      break;
                  }
+
+                 // C. Quota Guillotine Check (Fall-back)
+                 if local_quota.load(Ordering::Acquire) == 0 {
+                     tracing::warn!("Supervision: Quota exhausted (Guillotine cut). Terminating session.");
+                     break;
+                 }
             }
+        }
+    }
+
+    // Flush final consumed bytes back to BPF map
+    {
+        let final_consumed = consumed_bytes.load(Ordering::Acquire);
+        let mut auth_map = auth_state_map.lock().await;
+        if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+            if state.quota_bytes >= final_consumed {
+                state.quota_bytes -= final_consumed;
+            } else {
+                state.quota_bytes = 0;
+            }
+            let _ = auth_map.insert(client_subject, state, 0);
+            tracing::info!(
+                "Supervision: Synced final quota for {} (Consumed: {})",
+                client_subject,
+                final_consumed
+            );
         }
     }
 

@@ -22,3 +22,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aya = { version = "0.13", features = ["async_tokio"] }
 gateway-ebpf-common = { path = "../gateway-ebpf-common", features = ["user"] }
 bytes = "1"
+x509-parser = "0.18.1"

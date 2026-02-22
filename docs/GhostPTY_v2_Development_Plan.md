@@ -1,80 +1,142 @@
-# GhostPTY v2: 分阶段开发执行计划书 (Execution Roadmap)
+# GhostPTY v2.5: 分阶段开发执行计划书 (Execution Roadmap)
 
-为了将“无时域密码学状态机”的宏大架构安全且稳妥地落地，GhostPTY v2 的开发将被严密地拆分为 **三个核心阶段 (Phases)** 和 **九个关键里程碑 (Milestones)**。
+为了将“无时域密码学状态机”的宏大架构安全且稳妥地落地，并向最终的“分布式安全 L1”及“AI 网格总线”演进，GhostPTY v2.5 的开发将被严密地拆分为 **四个核心阶段 (Phases)** 和 **十四个关键里程碑 (Milestones)**。
 
 ---
 
-## Phase 1: 引擎淬火 (The Engine Forging)
+## 🟢 Phase 1: 引擎淬火 (The Engine Forging) - [✅ 已完成]
+
 **目标**: 彻底剥离 eBPF 层的物理时间依赖，完成基于哈希链 ($O(1)$) 的防丢包敲门机制与硬件级防 DDoS 模块。将系统的地基打得坚如磐石。
 
 ### Milestone 1.1: 哈希链验证器原型 (eBPF)
-*   **任务**:
-    *   在 `gateway-ebpf/src/main.rs` (或对应的 eBPF C 代码) 中，移除基于 Timestamp 的 SPA 解析逻辑。
-    *   引入带有 `Seq` 的 `[Seq, Hash]` 敲门包结构。
-    *   实现基于 `#pragma unroll` 的向前状态快进算法，容忍最大 10 次乱序/丢包。
-    *   **难点**: 确保 BPF Verifier 通过（控制计算复杂度）。
-*   **验收**: 构建单元测试，模拟乱序 UDP 流，验证 eBPF Map 中锚点的正确偏移与更新。
+
+* **状态**: ✅ 已完成 (代码见 `gateway-ebpf/src/main.rs`)。
+  * 在 XDP 层实现带序号的 $O(1)$ 查找：`[Seq: N-x, Hash: H_N-x]`。
+  * 利用 `#pragma unroll 10` 在内核执行受界有向循环，容忍最大 10 个 UDP 丢包的乱序快进，维护因果链韧性。
 
 ### Milestone 1.2: 软限流模块注入 (XDP Token Bucket)
-*   **任务**:
-    *   在现有的 `ALLOW_LIST_MAP` 中扩展值结构，加入并发突发计流字段。
-    *   实现无锁（或 `bpf_spin_lock`）的极低开销令牌桶（Token Bucket）逻辑。
-*   **验收**: 发射 10Gbps 的伪造源 IP (白名单中 IP) UDP 洪泛，验证网关 CPU 占用率无明显升高，且真正发往后端的合法流量仅受到轻微延迟。
+
+* **状态**: ✅ 已完成。
+  * 在现有的 `ALLOW_LIST_MAP` 中扩展值结构，加入并发突发计流字段 (`bucket_tokens` / `last_refill_ns`)。对于源 IP 在白名单中的海量垃圾突发流，直接在网卡层拦截。
 
 ### Milestone 1.3: 物理层垃圾回收绑定 (eBPF GC)
-*   **任务**:
-    *   编写用户态清理守护协程，通过 eBPF 系统调用 `bpf_map_delete_elem` 主动清理无效/僵尸条目。
-    *   确保配额燃尽与内核 Map 的删除操作具有强原子性。
-*   **验收**: 高频极速敲门压测 24 小时，监控内核 `bpf` 内存分配不再增长。
+
+* **状态**: ✅ 已完成。
+  * 用户态守护线程轮询 `AUTH_STATE_MAP`。当配额耗尽或长时间无响应时，同步清除 `ALLOW_LIST_MAP` 拔线。
 
 ---
 
-## Phase 2: 核算结界 (The Settlement Ward)
-**目标**: 在用户态的 `QUIC` 层建立极度严苛的“鉴权后按流量燃尽”系统，彻底防范“拒绝钱包攻击（Denial of Wallet）”。
+## 🟡 Phase 2.5: 核算结界与断头台 (The Settlement Ward) - [🎯 当前开发阶段]
 
-### Milestone 2.1: QUIC AEAD 字节拦截与计费
-*   **任务**:
-    *   深度介入 `quinn` (QUIC) 框架的数据接收层。
-    *   建立业务逻辑：只对 TLS/AEAD 解密成功的净荷字节（Payload Bytes）进行精确记账，累加至该连接对应的会话配额计数器中。
-*   **验收**: 模拟各类截断、重放、篡改内容的 QUIC 负载包，确保燃尽仪表的读数“绝不”因非法解密计算而增加。
+**目标**: 在不依赖外部区块链的情况下，于本地节点实现极速、防白嫖的流量核算与物理拔线闭环。
 
-### Milestone 2.2: 状态机降维结款闭环 (Burn-out Execution)
-*   **任务**:
-    *   一旦检测到当前配额燃尽，立即截断现时 QUIC 连接。
-    *   联动 M 1.3 的机制，即刻指使 eBPF 层在网卡物理拔除该 IP 许可网线。
-*   **验收**: 提供 1GB 测试配额，利用脚本自动化下载刚好超出额度的大文件，观察文件流会在哪个精准的字节位置被内核级残酷截断。
+### Milestone 2.1: 密码学双向水表 (The Cryptographic Meter)
+
+* **任务**:
+  * 拦截 `server/src/main.rs` 中 QUIC (quinn) `recv.read()` 和 `send.write_all()`。
+  * 只对 TLS 1.3 AEAD 成功解密的**纯有效载荷**进行字节统计，过滤垃圾耗散包。
+  * **内存聚合机制**: 引入 `SYNC_THRESHOLD` (如 64KB)，单连接在内存中高频累加。达阈值后低频原子扣减 eBPF Map 中的 `quota_bytes`，避免锁竞争。
+* **验收**: 发送 10Gbps 伪造 IP 垃圾流压测，配额仪表读数零波动；跑满 1GB 有效载荷时，内核 `quota_bytes` 误差 < 64KB。
+
+### Milestone 2.2: 物理级熔断器 (The Guillotine)
+
+* **任务**:
+  * 每次累加字节后实时判定：如果 `local_quota < consumed` 或 eBPF 查得 `quota_bytes == 0`，激活熔断。
+  * 不走正常的 QUIC `close()` 或 PTY 终止流程。直接 `break` 循环，强行销毁 Socket，并向 eBPF 发送即时拔线令。
+* **验收**: 配置 10MB 配额，传输 11MB 文件。连接必须在传输恰好越界时由于内核网卡级丢包瞬间假死，进程随之回收。
 
 ### Milestone 2.3: 密码学心跳质询 (Causal Heartbeat)
-*   **任务**:
-    *   设计基于控制流的轻量随机 Nonce 质询协议。
-    *   实现客户端的 Ed25519 签名响应机制与服务端的低频抽检验证。
-*   **验收**: 关闭客户端电源但未发送四次挥手断开信息，验证服务端是否能在规定质询周期未果后安全清理相关资源。
+
+* **任务**:
+  * 通过 QUIC 的单向 Control Stream 不定期下发随机 Nonce。
+  * 客户端必须返回基于其 DID 私钥（如 Ed25519）签署的验证盲注。
+  * 若多次质询超时未签或错签，直接调用 eBPF GC 抹除状态。
+* **验收**: 阻断客户端 Control Stream 发送能力但保持心跳，服务器主动剿杀“占坑死会话”成功。
+
+### Milestone 2.4: 身份凭证动态装载 (DID Parsing)
+
+* **任务**:
+  * 消除现存的硬编码 `client_subject = 1`。
+  * 从 `quinn` 获取的 `rustls::Certificate` 中解析基于 DID 的 CN，动态换算为 `u32` 唯一标识符供内核使用。
 
 ---
 
-## Phase 3: 幽灵泛洪 (The Global Gossip Consensus)
-**目标**: 从单机版的“结界”跨越至数百个节点共同交织的分布式去中心化 L1 网络。
+## 🔴 Phase 3: 深渊网格与全息共识 (The Abyssal Grid)
 
-### Milestone 3.1: 创世证书与冷启动自举 (Bootstrap)
-*   **任务**:
-    *   生成系统级的多签 Root Key。
-    *   设计新节点的入网请求验证包（包含 VC 可验证凭证）。
-    *   节点接收并对逐级签名的受信任性进行密码学验溯。
-*   **验收**: 部署一个不携带任何预置白名单的纯“冷”节点，验证其能通过合规的 Root 子凭证签名敲门包，自动授权并写入 Map。
+**目标**: 将全球孤立的 Ghost 节点连成一张具备自我愈合、光速同步和 0-Day 免疫的去中心化 L1 网络。
 
-### Milestone 3.2: 去中心化状态同步网格 (libp2p Gossip)
-*   **任务**:
-    *   将 `libp2p (GossipSub)` 集成入服务端。
-    *   定义 Ghost Grid 内部流通的极简事件流包序列：`GRANT`, `SLASH` 与配额消耗增量。
-*   **验收**: 启动本地 3 节点集群，User X 敲开 Node A，1 秒后尝试直连测试 Node B 与 C，验证全网开门。
+### Milestone 3.1: 混合 Gossip 控制面 (Hybrid Control Plane)
 
-### Milestone 3.3: 预言机黑匣子与防双花裁决 (CRDT & Audit)
-*   **任务**:
-    *   将 `audit_execve` 捕获的高危系统事件封装并通过 Gossip 存单。
-    *   实现乐观的分布式配额聚合（基于 CRDT G-Counter），处理跨区并发请求。如果探测到超出总额（双花），进行全网 `SLASH` (放逐) 广播。
-*   **验收**: 模拟双花耗配额场景以及执行 `rm -rf /` 高风险模拟，验证全节点在数秒内集体共识剥夺了该非法越界 DID 的全网物理准入资质。
+* **任务**: 集成 `rust-libp2p`。通过 GossipSub 协议作为网格神经，利用 CRDT 的 `G-Counter` 在全网无锁最终同步用户的流量配额与消耗。
+
+### Milestone 3.2: 创世证书与冷启动自举 (Genesis Bootstrap)
+
+* **任务**: 硬编码 3 把 Root Key 于守护进程中。新入网用户提供基于该信任链签发的 VC（可验证凭证）。单点首验通过即全网背书。
+
+### Milestone 3.3: 零日漏洞瞬间免疫网络 (0-Day Immunity Sync)
+
+* **任务**: 将既有的 eBPF `audit_execve` 捕获组件升级。一旦在某单点主机探测到供应链投毒或高危异常 Shell：
+  * 1. 提取包上下文。
+  * 1. 0.5s 内通过 GossipSub 泛洪全球。
+  * 1. 各节点瞬间下发规则入 XDP 黑名单。
+* **效果**: 全网瞬间获得 0-Day 永久抗体。
+
+### Milestone 3.4: 门限签名 SLASH 绝杀 (BFT Slash)
+
+* **任务**: 处理网络脑裂时的恶意吊销。只有集齐 `m-of-n` (如 3 个) 不同节点的联合签名确认，针对某 DID 的全网物理封杀令 (`SLASH` 指令) 方可在 eBPF 中生效。
 
 ---
 
-## 阶段优先级建议
-鉴于第一阶**哈希链定序**是对现有核心代码的最强破坏性但也最具意义的重构，建议研发团队在 Sprints Week 1 中以完全击破 **Milestone 1.1** 作为前置基础战役。
+## ⚫ Phase 4: 黑暗森林与价值收割 (The Dark Forest)
+
+**目标**: 技术底座大成，开启基于密码学和物理法则的降维打击商业变现。
+
+### Milestone 4.1: AI 智能体专属暗网通道 (Agentic Substrate)
+
+* **商业化**: 摒弃为人类做跳板机，专注 AI 间 (Devin, AutoGPT 等) 的原生高频控制总线。
+* **技术支撑**: 结合 M2.1 的水表计费，调用智能合约收取“指令穿透费（Gas）”。
+
+### Milestone 4.2: 零日漏洞套利暗池 (0-Day Arbitrage)
+
+* **变现手段**: 节点网络天然化身武器级蜜罐。将 eBPF (M3.3) 第一时间捕获到且被成功拦截的未知热 0-Day Payload 签名，通过加密 API 高频竞价拍卖给传统安全厂商。
+
+### Milestone 4.3: 算力大逃杀与全网放逐 (Cyber Excommunication)
+
+* **变现手段**:
+  * **呼吸税**: 拥堵期不按先来后到放行，要求在 QUIC 流中烧 Token，出价垫底的 10% IP 由 XDP 物理淘汰。
+  * **赏金通缉**: 任何人可发布加密赏金。待 Gossip 查明行为无误后，目标被全网拉入 XDP 黑洞，与现代服务彻底隔离。
+
+---
+
+> **下一步核心研发行动点 (Action Item):**
+> 开发资源在此刻全量压入 **Phase 2.5 `M 2.1 密码学双向水表`**。打开 `server/src/main.rs` 注入。
+
+---
+
+## 🏴 Phase Dark: 绞肉机与主动防御 (The Meat Grinder)
+**目标**: 放弃“被动拦截”，将系统升级为自带套利、反噬、降维打击能力的主动赛博防御武器。实施六大侵略性物理与协议级反制。
+
+### Milestone D.1: 焦油坑与薛定谔雷暴 (Tarpit & Schrödinger)
+*   **任务 (Phase 1 基础延展)**:
+    *   扩展 `gateway-ebpf/src/main.rs`。针对高频 TCP SYN 扫描，不执行 `XDP_DROP`，改为 `XDP_TX` 反射。伪造 `SYN-ACK` 并锁定极小 Window Size，死锁攻击者。
+    *   在未鉴权拦截前，随机吐出混淆性协议指纹（如假 SSH 头或大容量随机伪数据流）。
+*   **验收**: 运行 Nmap 满速扫描本机，验证攻击端 Nmap 内存暴涨、文件描述符耗尽或发生超时崩溃；本机 CPU 几乎无波动。
+
+### Milestone D.2: 算力吸星术 (Cryptographic Retaliation)
+*   **任务 (Phase 2 全新拦截)**:
+    *   当非信任海量 UDP 涌入，内核触发动态 PoW 下发。
+    *   应用端需针对特定 `Nonce` 计算并返回有效 Hash 盲注。
+*   **验收**: 利用 UDP 压力工具洪泛，网关不记录不计费，且成功要求攻击端出卖高强度 CPU 时间用于解题。攻击流量剧减。
+
+### Milestone D.3: 楚门沙箱与镜像劫持 (Honeypot & Mirror)
+*   **任务 (Phase 3 关联增强)**:
+    *   在 `audit_execve` 侦测到（M 3.3）高危 0-Day 或投毒行为时，不 Kill 进程。
+    *   通过 `bpf_redirect` 将其会话的网络包物理重定向至预先布好的“高价值假库 (Honeypot)” Cgroup/Namespace 中。
+    *   对于暴力破解阵列，用 NAT 改写包头，促发黑客源头 A 与黑客源头 B 的“狗咬狗”流量闭环。
+*   **验收**: 利用提权 Exploit 或已知恶意木马侵入，系统未报警但透明转入沙箱。全景记录其 C2 服务器通讯，并自动生成免杀特征码。
+
+### Milestone D.4: 放射性数据投毒 (Data Poisoning)
+*   **任务 (Phase 4 结合应用)**:
+    *   识别爬虫/恶意抓取器特征流。在 `server/src/main.rs` 的 HTTP/数据响应出口处。
+    *   动态植入对抗性样本（如针对 AI 的异常扰动像素、恶意诱导 Prompt），或导致常见 JSON 解析器栈溢出的畸形负荷。
+*   **验收**: 模拟已知恶意爬虫请求，捕获其因吞下含毒 Payload 导致的内存报错或崩溃。
