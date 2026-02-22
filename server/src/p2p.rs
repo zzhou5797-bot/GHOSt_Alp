@@ -124,9 +124,15 @@ pub async fn run_p2p(
                                     }
                                 }
                             }
-                            P2pMessage::Slash { subject, reason, issuer_did, signature_hex: _ } => {
+                            P2pMessage::Slash { subject, reason, issuer_did, signature_hex } => {
                                 info!("Received Slash Proposal from DID {} for DID {}: {}", issuer_did, subject, reason);
-                                // In production, we would mathematically verify `signature_hex` against `issuer_did`'s mapped public key
+
+                                // Phase 6.2: Sybil Threshold Cryptographic Check
+                                if !crate::genesis::verify_slash_signature(subject, issuer_did, &signature_hex) {
+                                    warn!("🚨 Dropped invalid BFT Slash signature from DID {}", issuer_did);
+                                    continue;
+                                }
+
                                 let votes = slash_votes.entry(subject).or_default();
                                 votes.insert(issuer_did);
 

@@ -13,6 +13,7 @@ use aya::{
 };
 use bytes::BytesMut;
 use clap::Parser;
+use ed25519_dalek::{Signer, SigningKey};
 use gateway_ebpf_common::{AuditEvent, AuthState};
 use quinn::{Endpoint, ServerConfig};
 use std::{
@@ -252,13 +253,25 @@ async fn main() -> Result<()> {
                         );
 
                         // ── 0-Day Anomaly Detection Heuristics ─────────────────
-                        let is_anomaly = filename.ends_with("/wget")
-                            || filename.ends_with("/curl")
-                            || filename.ends_with("/nc")
-                            || filename.ends_with("/nmap");
+                        let allowed_binaries = [
+                            "/bin/bash",
+                            "/bin/bash",
+                            "/bin/sh",
+                            "/bin/ls",
+                            "/bin/cat",
+                            "/usr/bin/clear",
+                            "/usr/bin/env",
+                            "/usr/bin/tmux",
+                            "/bin/grep",
+                            "/usr/bin/awk",
+                            "/bin/sed",
+                            "/usr/bin/id",
+                            "/usr/bin/whoami",
+                        ];
+                        let is_anomaly = !allowed_binaries.iter().any(|&x| x == filename);
 
                         if is_anomaly {
-                            tracing::error!("🚨 0-DAY HEURISTIC TRIPPED: Potential exploit payload downloader detected! ({})", filename);
+                            tracing::error!("🚨 0-DAY HEURISTIC TRIPPED: Execution outside Whitelist detected! ({})", filename);
                             // Trace cgroup back to DID
                             let tracker = cpu_tracker.lock().await;
                             if let Some(&subject) = tracker.get(&event.cgroup_id) {
@@ -267,6 +280,16 @@ async fn main() -> Result<()> {
                                     "🛡️ Broadcasting P2P Slash Consensus vote against DID: {}",
                                     subject
                                 );
+
+                                // Cryptographically Sign the Slash Action using Node's Private Key
+                                let dev_priv_hex = "7f39668096feb9fa23d09163759902043192f4800410aea9cc6fc3b331bcfdec";
+                                let mut priv_bytes = [0u8; 32];
+                                hex::decode_to_slice(dev_priv_hex, &mut priv_bytes).unwrap();
+                                let signing_key = SigningKey::from_bytes(&priv_bytes);
+                                let msg = format!("slash:{}:0", subject);
+                                let signature = signing_key.sign(msg.as_bytes());
+                                let signature_hex = hex::encode(signature.to_bytes());
+
                                 let _ = cpu_p2p_tx
                                     .send(p2p::P2pMessage::Slash {
                                         subject,
@@ -274,8 +297,8 @@ async fn main() -> Result<()> {
                                             "0-Day Heuristic: Remote Payload execution ({})",
                                             filename
                                         ),
-                                        issuer_did: 0, // In dev, we use 0 to represent the local Node
-                                        signature_hex: "dev-signature".to_string(),
+                                        issuer_did: 0, // Dev Node represents ID 0
+                                        signature_hex,
                                     })
                                     .await;
                             } else {
