@@ -290,26 +290,32 @@ async fn main() -> Result<()> {
                                 };
 
                                 // Cryptographically Sign the Slash Action using Node's Private Key
-                                let dev_priv_hex = "7f39668096feb9fa23d09163759902043192f4800410aea9cc6fc3b331bcfdec";
-                                let mut priv_bytes = [0u8; 32];
-                                hex::decode_to_slice(dev_priv_hex, &mut priv_bytes).unwrap();
-                                let signing_key = SigningKey::from_bytes(&priv_bytes);
-                                let msg = format!("slash:{}:{}", subject, target_sequence);
-                                let signature = signing_key.sign(msg.as_bytes());
-                                let signature_hex = hex::encode(signature.to_bytes());
+                                if let Ok(dev_priv_hex) = std::env::var("DEV_PRIV_KEY") {
+                                    let mut priv_bytes = [0u8; 32];
+                                    if hex::decode_to_slice(&dev_priv_hex, &mut priv_bytes).is_ok() {
+                                        let signing_key = SigningKey::from_bytes(&priv_bytes);
+                                        let msg = format!("slash:{}:{}", subject, target_sequence);
+                                        let signature = signing_key.sign(msg.as_bytes());
+                                        let signature_hex = hex::encode(signature.to_bytes());
 
-                                let _ = cpu_p2p_tx
-                                    .send(p2p::P2pMessage::Slash {
-                                        subject,
-                                        reason: format!(
-                                            "0-Day Heuristic: Remote Payload execution ({})",
-                                            filename
-                                        ),
-                                        issuer_did: 0, // Dev Node represents ID 0
-                                        signature_hex,
-                                        target_sequence,
-                                    })
-                                    .await;
+                                        let _ = cpu_p2p_tx
+                                            .send(p2p::P2pMessage::Slash {
+                                                subject,
+                                                reason: format!(
+                                                    "0-Day Heuristic: Remote Payload execution ({})",
+                                                    filename
+                                                ),
+                                                issuer_did: 0, // Dev Node represents ID 0
+                                                signature_hex,
+                                                target_sequence,
+                                            })
+                                            .await;
+                                    } else {
+                                        tracing::error!("Invalid DEV_PRIV_KEY hex format. Cannot broadcast slash.");
+                                    }
+                                } else {
+                                    tracing::error!("DEV_PRIV_KEY environment variable not set. Cannot broadcast slash.");
+                                }
                             } else {
                                 tracing::warn!("0-Day triggered but no matching subject found for cgroup_id {}", event.cgroup_id);
                             }
@@ -498,7 +504,13 @@ async fn main() -> Result<()> {
                 {
                     let mut auth_map = gc_auth_map.lock().await;
                     for subject in &to_evict {
-                        let _ = auth_map.remove(subject);
+                        // Do NOT remove from AUTH_STATE_MAP to prevent infinite genesis minting.
+                        // Instead, tombstone the subject by setting quota_bytes = 0 and revoked = 1.
+                        if let Ok(mut state) = auth_map.get(subject, 0) {
+                            state.quota_bytes = 0;
+                            state.revoked = 1;
+                            let _ = auth_map.insert(*subject, state, 0);
+                        }
                     }
                 }
                 {
@@ -510,7 +522,7 @@ async fn main() -> Result<()> {
                 }
 
                 if !to_evict.is_empty() {
-                    tracing::info!("[GC] cycle complete: evicted {} session(s)", to_evict.len());
+                    tracing::info!("[GC] cycle complete: tombstoned {} session(s)", to_evict.len());
                 }
             }
         });
@@ -544,7 +556,7 @@ async fn main() -> Result<()> {
             };
 
             // Log Client Auth Info and Parse DID Subject
-            let mut client_subject = 1; // Fallback
+            let client_subject;
             if let Some(identity) = connection.peer_identity() {
                 if let Some(certs) =
                     identity.downcast_ref::<Vec<rustls::pki_types::CertificateDer>>()
@@ -573,10 +585,10 @@ async fn main() -> Result<()> {
 
                             if dids_found > 1 {
                                 tracing::error!("Security Violation: Certificate contains multiple CNs. Rejecting DID hijacking attempt.");
-                                return; // Changed from continue to return to drop connection
+                                return;
                             } else if dids_found == 0 {
-                                tracing::warn!("Authentication Failed: No valid CN found.");
-                                return; // Changed from continue to return to drop connection
+                                tracing::error!("Authentication Failed: No valid CN found.");
+                                return;
                             }
 
                             if let Some(subject_id) = resolved_subject {
@@ -585,12 +597,25 @@ async fn main() -> Result<()> {
                                     "Resolved DID Subject from cert CN: {}",
                                     client_subject
                                 );
+                            } else {
+                                tracing::error!("Authentication Failed: Cannot resolve DID from cert.");
+                                return;
                             }
+                        } else {
+                            tracing::error!("Authentication Failed: Cannot parse certificate.");
+                            return;
                         }
+                    } else {
+                        tracing::error!("Authentication Failed: No certificate found in chain.");
+                        return;
                     }
+                } else {
+                    tracing::error!("Authentication Failed: Identity downcast failed.");
+                    return;
                 }
             } else {
-                tracing::warn!("Client connected without identity (should be rejected by rustls)");
+                tracing::error!("Security Violation: Client connected without valid MTLS identity.");
+                return;
             }
 
             let consumed_bytes = Arc::new(AtomicU64::new(0));
@@ -826,27 +851,29 @@ async fn handle_connection(
                 Ok(Some(n)) => {
                     let bytes_read = n as u64;
 
-                    let mut auth_map = to_pty_auth_map.lock().await;
-                    let mut quota_exhausted = false;
-                    if let Ok(mut state) = auth_map.get(&client_subject, 0) {
-                        if state.quota_bytes < bytes_read {
-                            state.quota_bytes = 0;
-                            quota_exhausted = true;
-                        } else {
-                            state.quota_bytes -= bytes_read;
-                        }
-                        let _ = auth_map.insert(client_subject, state, 0);
-                    }
-                    drop(auth_map);
-
-                    if quota_exhausted {
-                        tracing::warn!("Guillotine: Quota exhausted on Recv task (Atomic Cut)");
+                    // Implement Pre-Check Guillotine (Zero-lock upfront validation)
+                    if to_pty_consumed.load(Ordering::Relaxed) + bytes_read > initial_quota {
+                        tracing::warn!("Guillotine: Quota pre-check failed on Recv task (Atomic Cut).");
                         break;
                     }
 
+                    to_pty_consumed.fetch_add(bytes_read, Ordering::Relaxed);
                     local_unreported += bytes_read;
+
                     if local_unreported >= SYNC_THRESHOLD {
                         to_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
+
+                        let mut auth_map = to_pty_auth_map.lock().await;
+                        let mut quota_exhausted = false;
+                        if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                            state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
+                            if state.quota_bytes == 0 || state.revoked == 1 {
+                                quota_exhausted = true;
+                            }
+                            let _ = auth_map.insert(client_subject, state, 0);
+                        }
+                        drop(auth_map);
+
                         let _ = to_pty_p2p_tx
                             .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                                 client_subject,
@@ -855,6 +882,11 @@ async fn handle_connection(
                             }))
                             .await;
                         local_unreported = 0;
+
+                        if quota_exhausted {
+                            tracing::warn!("Guillotine: Quota exhausted or revoked during BPF Sync (Recv task).");
+                            break;
+                        }
                     }
 
                     if to_pty_tx.send(buf[..n].to_vec()).await.is_err() {
@@ -904,21 +936,9 @@ async fn handle_connection(
         while let Some(data) = from_pty_rx.recv().await {
             let len = data.len() as u64;
 
-            let mut auth_map = from_pty_auth_map.lock().await;
-            let mut quota_exhausted = false;
-            if let Ok(mut state) = auth_map.get(&client_subject, 0) {
-                if state.quota_bytes < len {
-                    state.quota_bytes = 0;
-                    quota_exhausted = true;
-                } else {
-                    state.quota_bytes -= len;
-                }
-                let _ = auth_map.insert(client_subject, state, 0);
-            }
-            drop(auth_map);
-
-            if quota_exhausted {
-                tracing::warn!("Guillotine: Quota exhausted on Send task (Atomic Cut)");
+            // Pre-Check Guillotine
+            if from_pty_consumed.load(Ordering::Relaxed) + len > initial_quota {
+                tracing::warn!("Guillotine: Quota pre-check failed on Send task (Atomic Cut).");
                 break;
             }
 
@@ -926,10 +946,23 @@ async fn handle_connection(
                 break;
             }
 
+            from_pty_consumed.fetch_add(len, Ordering::Relaxed);
             local_unreported += len;
 
             if local_unreported >= SYNC_THRESHOLD {
                 from_pty_synced.fetch_add(local_unreported, Ordering::Relaxed);
+
+                let mut auth_map = from_pty_auth_map.lock().await;
+                let mut quota_exhausted = false;
+                if let Ok(mut state) = auth_map.get(&client_subject, 0) {
+                    state.quota_bytes = state.quota_bytes.saturating_sub(local_unreported);
+                    if state.quota_bytes == 0 || state.revoked == 1 {
+                        quota_exhausted = true;
+                    }
+                    let _ = auth_map.insert(client_subject, state, 0);
+                }
+                drop(auth_map);
+
                 let _ = from_pty_p2p_tx
                     .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
                         client_subject,
@@ -938,6 +971,11 @@ async fn handle_connection(
                     }))
                     .await;
                 local_unreported = 0;
+
+                if quota_exhausted {
+                    tracing::warn!("Guillotine: Quota exhausted or revoked during BPF Sync (Send task).");
+                    break;
+                }
             }
         }
         let _ = send.finish();
@@ -1027,6 +1065,9 @@ async fn handle_connection(
             let mut auth_map = auth_state_map.lock().await;
             if let Ok(mut state) = auth_map.get(&client_subject, 0) {
                 state.quota_bytes = state.quota_bytes.saturating_sub(unsynced);
+                if state.quota_bytes == 0 {
+                    state.revoked = 1;
+                }
                 let _ = auth_map.insert(client_subject, state, 0);
                 tracing::info!(
                     "Supervision: Synced final quota for {} (Unsynced tail: {}, Total Session Consumed: {})",
