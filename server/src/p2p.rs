@@ -118,8 +118,9 @@ pub async fn run_p2p(
                             P2pMessage::Quota(_) => topic.clone(),
                             P2pMessage::Slash { .. } => slash_topic.clone(),
                         };
-                        if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, bytes) {
-                            warn!("Failed to publish local P2P message: {:?}", e);
+                        match swarm.behaviour_mut().gossipsub.publish(t, bytes) {
+                            Ok(msg_id) => info!("Gossip published (id={:?})", msg_id),
+                            Err(e) => warn!("Failed to publish local P2P message: {:?}", e),
                         }
                     }
                 }

@@ -269,10 +269,11 @@ async fn setup_quic_client(args: &ConnectArgs, pb: &ProgressBar) -> Result<Clien
 
     // 4. Configure TLS
     if args.insecure_skip_tls_verify {
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_client_auth_cert(vec![cert], priv_key)?;
+        crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
         ));
@@ -289,9 +290,10 @@ async fn setup_quic_client(args: &ConnectArgs, pb: &ProgressBar) -> Result<Clien
             roots.add(cert)?;
         }
 
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_client_auth_cert(vec![cert], priv_key)?;
+        crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
 
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,

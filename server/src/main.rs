@@ -182,6 +182,30 @@ async fn main() -> Result<()> {
 
     // AUTH_STATE_MAP is managed exclusively by the GC daemon (opened after bpf leak below).
 
+    // Startup seed: ensure subject=1 has a valid quota entry (idempotent).
+    // Required when the pinned BPF map entry was evicted by GC (quota exhausted)
+    // and the client does not carry a genesis VC.
+    {
+        let mut auth_map = auth_state_map.lock().await;
+        let needs_seed = match auth_map.get(&1u32, 0) {
+            Ok(state) => state.quota_bytes == 0,
+            Err(_) => true,
+        };
+        if needs_seed {
+            let state = AuthState {
+                expected_seq: 10000,
+                anchor_hash_lo: 0,
+                bucket_tokens: AuthState::MAX_TOKENS,
+                last_refill_ns: 0,
+                quota_bytes: 10_000_000_000, // 10 GiB
+                last_seen_quota_seq: 0,
+                revoked: 0,
+            };
+            let _ = auth_map.insert(1u32, state, 0);
+            tracing::info!("AUTH_STATE_MAP: seeded default quota for subject=1 (10 GiB)");
+        }
+    }
+
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
     // cgroup registration task independently.
     let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
@@ -492,28 +516,30 @@ async fn main() -> Result<()> {
 
                 // Collect subjects to evict
                 let mut to_evict: Vec<u32> = Vec::new();
-                let auth_map = gc_auth_map.lock().await;
-                let subjects: Vec<u32> = auth_map.keys().filter_map(|r| r.ok()).collect();
+                {
+                    let auth_map = gc_auth_map.lock().await;
+                    let subjects: Vec<u32> = auth_map.keys().filter_map(|r| r.ok()).collect();
 
-                for subject in &subjects {
-                    if let Ok(state) = auth_map.get(subject, 0) {
-                        let is_exhausted = state.quota_bytes == 0;
-                        let elapsed = ktime_ns.saturating_sub(state.last_refill_ns);
-                        let is_dead = state.bucket_tokens == 0 && elapsed > DEAD_NS;
+                    for subject in &subjects {
+                        if let Ok(state) = auth_map.get(subject, 0) {
+                            let is_exhausted = state.quota_bytes == 0;
+                            let elapsed = ktime_ns.saturating_sub(state.last_refill_ns);
+                            let is_dead = state.bucket_tokens == 0 && elapsed > DEAD_NS;
 
-                        if is_exhausted {
-                            tracing::info!("[GC] subject={} quota exhausted — evicting", subject);
-                            to_evict.push(*subject);
-                        } else if is_dead {
-                            tracing::info!(
-                                "[GC] subject={} idle {}s — evicting dead session",
-                                subject,
-                                elapsed / 1_000_000_000
-                            );
-                            to_evict.push(*subject);
+                            if is_exhausted {
+                                tracing::info!("[GC] subject={} quota exhausted — evicting", subject);
+                                to_evict.push(*subject);
+                            } else if is_dead {
+                                tracing::info!(
+                                    "[GC] subject={} idle {}s — evicting dead session",
+                                    subject,
+                                    elapsed / 1_000_000_000
+                                );
+                                to_evict.push(*subject);
+                            }
                         }
                     }
-                }
+                } // auth_map guard dropped here
 
                 // Also collect any IP entries whose subject has been evicted
                 let allow_map = gc_allow_map.lock().await;
@@ -804,6 +830,7 @@ async fn handle_connection(
         }
     };
 
+    tracing::info!("[DIAG] initial_quota={}", initial_quota);
     if initial_quota == 0 {
         return Err(anyhow::anyhow!("Zero quota. Connection rejected."));
     }
@@ -813,6 +840,7 @@ async fn handle_connection(
         .send((client_ip, client_subject, true))
         .await
         .ok();
+    tracing::info!("[DIAG] ALLOW_LIST_MAP updated");
 
     // 3. Prepare empty Session Cgroup FIRST
     static SESSION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -836,14 +864,17 @@ async fn handle_connection(
         .map(|cg| cg.path.join("cgroup.procs"));
 
     // 4. Execution Phase: Spawn PTY with Config and Cgroup Hook
+    tracing::info!("[DIAG] Spawning PTY...");
     let session =
         session::PtySession::new(handshake.pty_size, handshake.env_vars, cgroup_procs_path)?;
     let child_pid = session.child_pid;
+    tracing::info!("[DIAG] PTY spawned: child_pid={}", child_pid);
     let mut child_guard = session.child;
 
     // We separate the pair manually because we need ownership of master
     let pair = session.pair;
     drop(pair.slave); // Allow close propagation
+    tracing::info!("[DIAG] PTY slave dropped, calling accept_bi...");
 
     let mut master_reader = pair.master.try_clone_reader()?;
     let mut master_writer = pair.master.take_writer()?;
