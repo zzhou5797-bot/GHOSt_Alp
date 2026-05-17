@@ -1,7 +1,8 @@
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux, Swarm,
+    gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux, Multiaddr,
+    Swarm,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -84,11 +85,27 @@ pub async fn run_p2p(
         >,
     >,
     mut local_updates_rx: mpsc::Receiver<P2pMessage>,
+    bootstrap_peers: Vec<Multiaddr>,
 ) {
     let topic = gossipsub::IdentTopic::new("ghost_grid_quota");
     let slash_topic = gossipsub::IdentTopic::new("ghost_grid_slash");
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&slash_topic);
+
+    // Listen on an OS-assigned TCP port so remote peers can connect back to us.
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("valid multiaddr"))
+        .ok();
+
+    // Dial every bootstrap peer provided via --bootstrap-peers.
+    // gossipsub will discover further peers through these initial connections.
+    for addr in &bootstrap_peers {
+        if let Err(e) = swarm.dial(addr.clone()) {
+            warn!("Failed to dial bootstrap peer {}: {:?}", addr, e);
+        } else {
+            info!("Dialing bootstrap peer: {}", addr);
+        }
+    }
 
     let mut slash_votes: HashMap<(u32, u64), HashSet<u32>> = HashMap::new();
 

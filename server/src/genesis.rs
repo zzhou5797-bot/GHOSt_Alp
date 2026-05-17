@@ -3,19 +3,30 @@ use serde::{Deserialize, Serialize};
 
 use shared::GenesisCredential;
 
-// Hardcoded Genesis Root Keys for Phase 3.2 Bootstrap
-// In a real production system, these are carefully guarded cold-storage offline keys.
+// ── Genesis Bootstrap Key Array (for GenesisCredential index lookup) ─────────
+// `pubkey_index` in GenesisCredential is an index into this array.
+// This is intentionally separate from the DID namespace.
 pub const GENESIS_KEYS_HEX: &[&str] = &[
-    "7a2d1237b19877ba382a493547e600e4dbf6b43c79702a5802dbe6b0d5d9e933", // Placeholder Key 1 (DEV Node 0 Pubkey)
-    "f2c6c061fc621defa7c41ebdd8a6bebf4cfc3fc3b8398453ef63bc180abebd2f", // Placeholder Key 2
+    "7a2d1237b19877ba382a493547e600e4dbf6b43c79702a5802dbe6b0d5d9e933", // Bootstrap Key 0
+    "f2c6c061fc621defa7c41ebdd8a6bebf4cfc3fc3b8398453ef63bc180abebd2f", // Bootstrap Key 1
 ];
 
-pub fn verify_slash_signature(subject: u32, issuer_did: u32, signature_hex: &str) -> bool {
-    if (issuer_did as usize) >= GENESIS_KEYS_HEX.len() {
-        return false;
+// ── DID → Authorized Slash Pubkey Map ─────────────────────────────────────────
+// Maps a node's DID (arbitrary u32, not an array index) to its Ed25519 pubkey.
+// New authorized slash nodes are added here without renumbering existing DIDs.
+fn slash_pubkey_for_did(did: u32) -> Option<&'static str> {
+    match did {
+        0 => Some("7a2d1237b19877ba382a493547e600e4dbf6b43c79702a5802dbe6b0d5d9e933"),
+        1 => Some("f2c6c061fc621defa7c41ebdd8a6bebf4cfc3fc3b8398453ef63bc180abebd2f"),
+        _ => None,
     }
+}
 
-    let pubkey_hex = GENESIS_KEYS_HEX[issuer_did as usize];
+pub fn verify_slash_signature(subject: u32, issuer_did: u32, signature_hex: &str) -> bool {
+    let pubkey_hex = match slash_pubkey_for_did(issuer_did) {
+        Some(h) => h,
+        None => return false,
+    };
     let mut pubkey_bytes = [0u8; 32];
     if hex::decode_to_slice(pubkey_hex, &mut pubkey_bytes).is_err() {
         return false;

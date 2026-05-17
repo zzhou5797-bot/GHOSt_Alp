@@ -1,7 +1,7 @@
-# 📜 Ghost Grid 创世蓝图 (v2.5 修订版)：从工具到物理法则
+# 📜 Ghost Grid 创世蓝图 (v3.0)：从工具到物理法则
 
 **代号:** Timeless Aegis (无时域之盾)
-**修订时间:** 2026-02-22
+**修订时间:** 2026-05-17
 **定位终极愿景:** Ghost Grid 不对标任何 VPN 或传统堡垒机产品，它的终极坐标是**"去中心化安全基础设施（DeSec）"**与**"AI 时代的原生跨机总线"**——在内核物理层执行因果律，在协议层实现 0-Day 天然免疫，在经济层吞噬黑暗森林的每一分价值。
 
 ---
@@ -28,7 +28,7 @@ GhostPTY v2 的根基是彻底摒弃"物理时间"这一易被攻击的系统依
 
 ---
 
-## 当前代码库快照 (v2.5 实现状态)
+## 当前代码库快照 (v3.0 实现状态)
 
 ### ✅ Phase 1 (已完成): 引擎淬火
 
@@ -38,23 +38,47 @@ GhostPTY v2 的根基是彻底摒弃"物理时间"这一易被攻击的系统依
 | SPA v1 时间戳兼容层（双栈过渡期） | `gateway-ebpf/src/main.rs` | ✅ |
 | XDP Token Bucket 软限流（防伪造 IP 洪泛） | `gateway-ebpf/src/main.rs` | ✅ |
 | `AUTH_STATE_MAP`, `ALLOW_LIST_MAP`, `AUDIT_CGROUP_MAP` | `gateway-ebpf-common/src/lib.rs` | ✅ |
-| eBPF GC 守护进程（10s 轮询，配额燃尽/死会话驱逐） | `server/src/main.rs` | ✅ |
+| eBPF GC 守护进程（10s 轮询，配额燃尽/死会话 tombstone） | `server/src/main.rs` | ✅ |
 | `audit_execve` Tracepoint（cgroup 过滤，5 argv 捕获） | `gateway-ebpf/src/main.rs` | ✅ |
 | eBPF Map Pinning（`/sys/fs/bpf/ghostpty`，重启持久化） | `server/src/main.rs` | ✅ |
 
-### 🟡 Phase 2 (进行中): 核算结界
+### ✅ Phase 2 (已完成): 核算结界
 
 | 模块 | 实现位置 | 状态 |
 |---|---|---|
 | QUIC mTLS 双向认证（rustls CA + 客户端证书） | `server/src/main.rs` | ✅ |
-| `AuthState.quota_bytes` 字段已定义 | `gateway-ebpf-common/src/lib.rs` | ✅ |
-| **QUIC AEAD 字节级精确计费（当前工作前线）** | `server/src/main.rs` | 🟡 缺失扣减逻辑 |
-| DID Subject 从 mTLS cert CN 解析 | `server/src/main.rs` | 🟡 硬编码为 `1` |
-| 密码学心跳质询（Causal Heartbeat） | — | ❌ |
+| QUIC AEAD 字节级精确计费（SYNC_THRESHOLD 64KB） | `server/src/main.rs` | ✅ |
+| The Guillotine：配额燃尽硬断线 + ALLOW_LIST 即时驱逐 | `server/src/main.rs` | ✅ |
+| DID Subject 从 mTLS cert CN 解析（X.509 CN → u32） | `server/src/main.rs` | ✅ |
 
-### ❌ Phase 3+ (未开始): 幽灵泛洪与黑暗森林
+### ✅ Phase 3 (已完成): 深渊网格与全息共识
 
-全部未开始。详见下方路线图。
+| 模块 | 实现位置 | 状态 |
+|---|---|---|
+| libp2p GossipSub 控制面（quota + slash 双 topic） | `server/src/p2p.rs` | ✅ |
+| mDNS 局域网节点发现 | `server/src/p2p.rs` | ✅ |
+| `--bootstrap-peers` 跨网络节点发现（逗号分隔 multiaddr） | `server/src/main.rs`, `p2p.rs` | ✅ |
+| 创世证书 Genesis VC（Ed25519 签名 + pubkey_index） | `server/src/genesis.rs` | ✅ |
+| 0-Day Immunity：execve 白名单 + BFT slash 广播 | `server/src/main.rs` | ✅ |
+| BFT Slash 共识（3/N 门限 + Ed25519 签名验证） | `server/src/p2p.rs`, `genesis.rs` | ✅ |
+
+### ✅ Phase 6-7 (已完成): 因果律强化
+
+| 模块 | 实现位置 | 状态 |
+|---|---|---|
+| `last_seen_quota_seq` 防过期 slash 投票 | `server/src/p2p.rs` | ✅ |
+| DID→pubkey 映射解耦（不再用数组索引当 DID） | `server/src/genesis.rs` | ✅ |
+| `slash_pubkey_for_did()` 可扩展注册表 | `server/src/genesis.rs` | ✅ |
+| cgroup_id → DID 反查（audit anomaly 溯源） | `server/src/main.rs` | ✅ |
+| `nonce_cache` OOM 漏洞修复（Phase 7.3 eradicated） | `server/src/main.rs` | ✅ |
+
+### 🎯 下一里程碑：跨节点集成测试
+
+协议核心已完整。当前焦点是验证多节点网络：
+
+1. **层次 1**：`cargo test -p ghost-chain-tests`（纯逻辑，无需 root）
+2. **层次 2**：单节点集成测试（需要 Linux root + eBPF）
+3. **层次 3**：双节点 `--bootstrap-peers` 跨机测试（组网后进行）
 
 ---
 

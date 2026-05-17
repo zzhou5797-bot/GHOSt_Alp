@@ -46,6 +46,12 @@ struct Args {
 
     #[arg(long, default_value = "lo")]
     iface: String,
+
+    /// Comma-separated list of bootstrap peer multiaddrs for cross-network discovery.
+    /// Example: /ip4/1.2.3.4/tcp/7700/p2p/12D3KooW...
+    /// When omitted, only mDNS local-network discovery is used.
+    #[arg(long, value_delimiter = ',')]
+    bootstrap_peers: Vec<String>,
 }
 
 #[tokio::main]
@@ -201,9 +207,26 @@ async fn main() -> Result<()> {
     let manager_cgroup_tracker = Arc::clone(&cgroup_to_subject);
 
     // ── Phase 3.1: Gossipsub P2P Swarm ──────────────────────────────────────────
+    let bootstrap_multiaddrs: Vec<libp2p::Multiaddr> = args
+        .bootstrap_peers
+        .iter()
+        .filter_map(|s| match s.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                tracing::warn!("Ignoring invalid bootstrap peer address '{}': {}", s, e);
+                None
+            }
+        })
+        .collect();
+
     let (p2p_tx, p2p_rx) = tokio::sync::mpsc::channel::<p2p::P2pMessage>(1024);
     if let Ok(swarm) = p2p::build_swarm() {
-        tokio::spawn(p2p::run_p2p(swarm, Arc::clone(&auth_state_map), p2p_rx));
+        tokio::spawn(p2p::run_p2p(
+            swarm,
+            Arc::clone(&auth_state_map),
+            p2p_rx,
+            bootstrap_multiaddrs,
+        ));
         tracing::info!("Phase 3.1: Hybrid Gossipsub Control Plane initialized.");
     } else {
         tracing::error!("Failed to initialize P2P swarm. Gossipsub disabled.");
