@@ -35,10 +35,12 @@ GhostPTY is a remote terminal built on this protocol. The terminal is the proof 
 
 ## Architecture
 
+> **Tech-preview note**: the current implementation runs Ghost Protocol L2/L3 frames *over* UDP and QUIC, because those are available on today's Linux hardware. This is intentional scaffolding — the L1 Substrate abstraction means the same frames will run over raw 802.11, LoRa, or serial once those Substrate implementations land. The goal is not "better VPN"; the goal is "works when there is no internet."
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Client                                                       │
-│  SPA knock (UDP) → QUIC mTLS connect → PTY I/O streams       │
+│  Ghost Protocol L2 Knock → L2 Data (QUIC carrier, tech-val)  │
 └────────────────────────────┬─────────────────────────────────┘
                              │ UDP / QUIC
 ┌────────────────────────────▼─────────────────────────────────┐
@@ -87,28 +89,20 @@ GhostPTY is a remote terminal built on this protocol. The terminal is the proof 
 
 ---
 
-## The Problem with Building on TCP/IP
+## Ghost Protocol vs. the TCP/IP Stack
 
-Every tool in this space is built on top of TCP/IP and inherits its centralized dependencies:
+Ghost Protocol is not a tool built on top of TCP/IP. It is a replacement for the infrastructure assumptions that TCP/IP requires. Every layer has a direct equivalent:
 
-| Dependency | Who controls it | What happens if they act against you |
-|------------|----------------|--------------------------------------|
-| IP address | IANA → RIR → ISP | Address revoked, traffic rerouted |
-| BGP routing | Tier-1 ASes | Route hijack (this has happened) |
-| DNS name | ICANN → registrar | Domain seized or suspended |
-| TLS certificate | CA (Let's Encrypt, DigiCert…) | Certificate revoked, HTTPS breaks |
-| Cloud infra | AWS / GCP / Azure | Account terminated, endpoints gone |
+| TCP/IP infrastructure | Controlled by | Ghost Protocol equivalent |
+|-----------------------|--------------|---------------------------|
+| IP addressing | IANA → RIR → ISP (your address is a lease) | **DID** — u32 derived from hash chain, no authority involved |
+| Routing (BGP) | Tier-1 ASes; trust-based, hijackable | **L1 Substrate mesh** — any physical bearer, no routing table authority |
+| Naming (DNS) | ICANN → registrar hierarchy | **DID** — no name system, addresses are hash-chain proofs |
+| Identity (PKI/CA) | Certificate Authorities; legally compellable | **Hash-chain self-certification** — math, no issuer |
+| Transport (TCP/UDP) | Requires routable IP end-to-end | **GhostFrame over Substrate** — works over UDP, LoRa, 802.11, serial |
+| Revocation | Unilateral (CA revokes cert, ISP revokes IP) | **BFT multi-sig consensus** — no single party can act alone |
 
-Ghost Protocol is designed to not require any of these. A node is identified by a DID derived from a hash chain — no RIR, no registrar, no CA involved. The link layer is pluggable — no assumption that IP routing is available.
-
-| | Tailscale | Cloudflare Tunnel | WireGuard (self-hosted) | **GhostPTY / Ghost Protocol** |
-|---|---|---|---|---|
-| Requires routable IP | Yes | Yes | Yes | **No (DID addressing)** |
-| Requires CA / PKI | Yes | Yes | Yes (for trust) | **No for L2 auth** |
-| Requires coordination server | Yes (their cloud) | Yes (their edge) | No | **No** |
-| Requires internet (TCP/IP) | Yes | Yes | Yes | **No — LoRa / 802.11 / serial** |
-| Kernel-layer enforcement | No | No | No | **Yes — XDP before IP stack** |
-| Revocation by consensus | No | No | No | **Yes — BFT multi-sig** |
+Ghost Protocol does not compete with SSH, Tailscale, or WireGuard. Those are applications built on TCP/IP. Ghost Protocol competes with the stack underneath them.
 
 ---
 
