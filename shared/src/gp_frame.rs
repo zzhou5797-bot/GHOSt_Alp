@@ -331,9 +331,22 @@ pub struct UdpSubstrate {
 
 impl UdpSubstrate {
     /// Bind to `bind_addr` (e.g. `"0.0.0.0:9000"`).
+    /// Pass `"127.0.0.1:0"` to let the OS pick a free port.
     pub fn bind(bind_addr: &str) -> io::Result<Self> {
         let socket = std::net::UdpSocket::bind(bind_addr)?;
         Ok(UdpSubstrate { socket })
+    }
+
+    /// Return the local address this substrate is bound to.
+    /// Useful for tests that need to tell another party where to send frames.
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Set the read timeout for `recv()`.  Pass `None` to block indefinitely.
+    /// Used in tests to prevent hangs; not required in production daemons.
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(dur)
     }
 }
 

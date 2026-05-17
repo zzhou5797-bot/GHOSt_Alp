@@ -557,3 +557,224 @@ mod quota_tests {
         assert!(!synced, "Sync must NOT fire before SYNC_THRESHOLD bytes consumed");
     }
 }
+
+// ── Ghost Protocol: Real UDP Integration Tests ────────────────────────────────
+//
+// These tests exercise the full Ghost Protocol stack over actual loopback UDP
+// sockets — no mocking.  Each test:
+//   1. Binds two UdpSubstrate instances on 127.0.0.1:0 (OS-assigned ports)
+//   2. Encodes Ghost Frame(s) using the canonical wire format
+//   3. Sends over the real kernel UDP path
+//   4. Decodes on the receiver side and asserts field-level correctness
+//
+// Test topology:
+//
+//   [sender UdpSubstrate] ──UDP loopback──► [receiver UdpSubstrate]
+//
+// Coverage:
+//   ● gp_udp_knock_roundtrip           — L2 Knock frame, all header fields
+//   ● gp_udp_data_with_session_frame   — L2 Data + L3 SessionFrame::PtyData
+//   ● gp_udp_knock_ack_bidirectional   — full request/reply exchange (A→B Knock, B→A Ack)
+//   ● gp_udp_resize_roundtrip          — L3 PtyResize rows/cols survive full stack
+#[cfg(test)]
+mod gp_udp_integration {
+    use shared::gp_frame::{
+        FrameType, GhostFrame, SessionFrame, SessionType, Substrate, UdpSubstrate,
+    };
+    use std::net::SocketAddr;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    /// Bind a UdpSubstrate on loopback with an OS-assigned port.
+    /// A 5-second read timeout prevents tests from hanging on unexpected failures.
+    fn bind_local() -> UdpSubstrate {
+        let s = UdpSubstrate::bind("127.0.0.1:0").expect("bind");
+        s.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout");
+        s
+    }
+
+    /// Encode `addr` as the 6-byte `[a, b, c, d, port_hi, port_lo]` format
+    /// expected by `UdpSubstrate::send`.
+    fn dst(addr: SocketAddr) -> Vec<u8> {
+        match addr {
+            SocketAddr::V4(v4) => {
+                let [a, b, c, d] = v4.ip().octets();
+                let [ph, pl] = v4.port().to_be_bytes();
+                vec![a, b, c, d, ph, pl]
+            }
+            SocketAddr::V6(_) => panic!("IPv6 not expected in loopback test"),
+        }
+    }
+
+    // ── Test 1: L2 Knock roundtrip ────────────────────────────────────────────
+
+    /// Encode a `Knock` frame on the sender side, send over UDP, decode on the
+    /// receiver side, and verify every header field matches exactly.
+    ///
+    /// This validates the entire L2 encode → kernel UDP path → L2 decode cycle.
+    #[test]
+    fn gp_udp_knock_roundtrip() {
+        let receiver = bind_local();
+        let rx_addr  = receiver.local_addr().unwrap();
+
+        // Spawn receiver thread — blocks on recv() until the frame arrives.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (_src, bytes) = receiver.recv().expect("recv");
+            let (frame, _)    = GhostFrame::decode(&bytes).expect("decode").expect("complete frame");
+            tx.send(frame).expect("channel send");
+        });
+
+        // Encode and send the Knock frame.
+        let sender = bind_local();
+        let mut buf = Vec::new();
+        GhostFrame::knock(100, 200, 9999, 0xdeadbeefcafebabe)
+            .encode(&mut buf).expect("encode");
+        sender.send(&dst(rx_addr), &buf).expect("UDP send");
+
+        // Verify every field survives the wire.
+        let frame = rx.recv_timeout(Duration::from_secs(5)).expect("channel recv timeout");
+        assert_eq!(frame.frame_type, FrameType::Knock,   "frame_type");
+        assert_eq!(frame.did_src,    100,                "did_src");
+        assert_eq!(frame.did_dst,    200,                "did_dst");
+        assert_eq!(frame.chain_seq,  9999,               "chain_seq");
+        assert_eq!(frame.chain_tag,  0xdeadbeefcafebabe, "chain_tag");
+        assert!(frame.payload.is_empty(),                "Knock payload must be empty");
+    }
+
+    // ── Test 2: L2 Data + L3 SessionFrame::PtyData roundtrip ─────────────────
+
+    /// Build a `SessionFrame::PtyData`, embed it in a `GhostFrame::Data`, send
+    /// over UDP, then decode both L2 and L3 layers on the receiver and verify
+    /// every field.
+    ///
+    /// This is the primary data-plane path used for PTY stdin/stdout bytes.
+    #[test]
+    fn gp_udp_data_with_session_frame_roundtrip() {
+        let receiver = bind_local();
+        let rx_addr  = receiver.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (_src, bytes) = receiver.recv().expect("recv");
+            let (gf, _) = GhostFrame::decode(&bytes).expect("L2 decode").expect("L2 complete");
+            let (sf, _) = SessionFrame::decode(&gf.payload).expect("L3 decode").expect("L3 complete");
+            tx.send((gf, sf)).expect("channel send");
+        });
+
+        // L3: PTY stdin bytes
+        let pty_bytes = b"echo hello\r\n".to_vec();
+        let mut l3_buf = Vec::new();
+        SessionFrame::pty_data(0, pty_bytes.clone())
+            .encode(&mut l3_buf).expect("L3 encode");
+
+        // L2: wrap in Data frame
+        let sender = bind_local();
+        let mut buf = Vec::new();
+        GhostFrame::data(42, 7, 500, 0xabcdef1234567890, l3_buf)
+            .encode(&mut buf).expect("L2 encode");
+        sender.send(&dst(rx_addr), &buf).expect("UDP send");
+
+        let (gf, sf) = rx.recv_timeout(Duration::from_secs(5)).expect("timeout");
+        assert_eq!(gf.frame_type,     FrameType::Data,      "L2 type");
+        assert_eq!(gf.did_src,        42,                    "L2 did_src");
+        assert_eq!(gf.did_dst,        7,                     "L2 did_dst");
+        assert_eq!(gf.chain_seq,      500,                   "L2 chain_seq");
+        assert_eq!(gf.chain_tag,      0xabcdef1234567890,    "L2 chain_tag");
+        assert_eq!(sf.session_type,   SessionType::PtyData,  "L3 type");
+        assert_eq!(sf.stream_id,      0,                     "L3 stream_id");
+        assert_eq!(sf.payload,        pty_bytes,             "L3 payload");
+    }
+
+    // ── Test 3: Bidirectional Knock→Ack exchange ──────────────────────────────
+
+    /// Node A sends a `Knock` to node B.  Node B decodes it and replies with an
+    /// `Ack` addressed back to A.  Node A decodes the `Ack` and verifies the
+    /// reflected DID fields.
+    ///
+    /// This exercises the UDP src-address echo path used by `UdpSubstrate::recv`
+    /// (it returns the sender's 6-byte encoded address so the receiver can reply
+    /// without maintaining a routing table).
+    #[test]
+    fn gp_udp_knock_ack_bidirectional() {
+        let node_a = bind_local();
+        let node_b = bind_local();
+        let addr_a = node_a.local_addr().unwrap();
+        let addr_b = node_b.local_addr().unwrap();
+
+        // B: receives Knock from A, sends Ack back to A using the src address
+        // returned by recv() — no explicit routing needed.
+        thread::spawn(move || {
+            let (src_bytes, bytes) = node_b.recv().expect("B recv");
+            let (knock, _) = GhostFrame::decode(&bytes).expect("B decode").expect("complete");
+            assert_eq!(knock.frame_type, FrameType::Knock, "B: expected Knock");
+
+            let ack = GhostFrame {
+                frame_type: FrameType::Ack,
+                flags:      0,
+                did_src:    knock.did_dst, // B's DID
+                did_dst:    knock.did_src, // back to A
+                chain_seq:  knock.chain_seq,
+                chain_tag:  knock.chain_tag,
+                payload:    vec![],
+            };
+            let mut ack_buf = Vec::new();
+            ack.encode(&mut ack_buf).expect("B encode Ack");
+            node_b.send(&src_bytes, &ack_buf).expect("B send Ack");
+        });
+
+        // A: send Knock to B.
+        let mut knock_buf = Vec::new();
+        GhostFrame::knock(1, 2, 8000, 0x1122334455667788)
+            .encode(&mut knock_buf).expect("A encode Knock");
+        node_a.send(&dst(addr_b), &knock_buf).expect("A send Knock");
+
+        // A: receive Ack from B.
+        let (_src, ack_bytes) = node_a.recv().expect("A recv Ack");
+        let (ack, _) = GhostFrame::decode(&ack_bytes).expect("A decode Ack").expect("complete");
+        assert_eq!(ack.frame_type, FrameType::Ack, "A: expected Ack");
+        assert_eq!(ack.did_src,    2,               "Ack did_src = B's DID");
+        assert_eq!(ack.did_dst,    1,               "Ack did_dst = A's DID");
+        assert_eq!(ack.chain_seq,  8000,            "chain_seq reflected");
+
+        // Suppress unused warning — addr_a is the bind address, not needed for
+        // routing since B echoes the UDP src; kept here for documentation.
+        let _ = addr_a;
+    }
+
+    // ── Test 4: PtyResize rows/cols survive full stack ────────────────────────
+
+    /// Verify that a `PtyResize` session frame (rows=48, cols=160) survives the
+    /// full encode → L2 wrap → UDP → L2 decode → L3 decode cycle with the
+    /// numeric values intact.
+    #[test]
+    fn gp_udp_resize_roundtrip() {
+        let receiver = bind_local();
+        let rx_addr  = receiver.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (_src, bytes) = receiver.recv().expect("recv");
+            let (gf, _) = GhostFrame::decode(&bytes).expect("L2 decode").expect("L2 complete");
+            let (sf, _) = SessionFrame::decode(&gf.payload).expect("L3 decode").expect("L3 complete");
+            tx.send(sf).expect("send");
+        });
+
+        let mut l3_buf = Vec::new();
+        SessionFrame::pty_resize(1, 48, 160).encode(&mut l3_buf).expect("L3 encode");
+
+        let sender = bind_local();
+        let mut buf = Vec::new();
+        GhostFrame::data(3, 4, 100, 0, l3_buf).encode(&mut buf).expect("L2 encode");
+        sender.send(&dst(rx_addr), &buf).expect("UDP send");
+
+        let sf   = rx.recv_timeout(Duration::from_secs(5)).expect("timeout");
+        let rows = u16::from_le_bytes(sf.payload[0..2].try_into().unwrap());
+        let cols = u16::from_le_bytes(sf.payload[2..4].try_into().unwrap());
+        assert_eq!(sf.session_type, SessionType::PtyResize, "session type");
+        assert_eq!(sf.stream_id,    1,                       "stream_id");
+        assert_eq!(rows,            48,                      "rows");
+        assert_eq!(cols,            160,                     "cols");
+    }
+}

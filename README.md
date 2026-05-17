@@ -123,11 +123,73 @@ Slash votes are verified with `verify_slash_signature()` against the live `Valid
 | Crate | Role |
 |-------|------|
 | `server` | Gateway daemon: QUIC endpoint, eBPF map management, session lifecycle, GC, audit |
-| `shared` | Wire types shared between server and client: `ControlMessage`, `GenesisCredential` |
+| `shared` | Wire types shared between server and client: `ControlMessage`, `GenesisCredential`, and the **Ghost Protocol frame codec** (`gp_frame`) |
 | `gateway-ebpf` | Kernel BPF programs: XDP SPA verifier + rate limiter, `audit_execve` tracepoint |
 | `gateway-ebpf-common` | `no_std` types shared between eBPF and userspace: `AuthState`, `AuditEvent`, `SpaPayload`, `SovereignItem` |
-| `ghost-chain-tests` | Integration test harness for the hash-chain and quota subsystems |
+| `ghost-chain-tests` | Integration test harness: hash-chain / quota subsystems + Ghost Protocol real-UDP stack tests |
 | `xtask` | Build automation: `cargo xtask build-ebpf` compiles the BPF target; `cargo run --bin gov` manages Tier-1 validator keys |
+
+---
+
+## Ghost Protocol
+
+GhostPTY implements a three-layer substrate-agnostic protocol for authenticated, self-certifying communication. The Ghost Protocol is implemented in `shared::gp_frame`.
+
+```
+┌──────────────────────────────────────────┐
+│  L3  SessionFrame  — stream mux + PTY    │
+│      PtyData / PtyResize / Meta /        │
+│      StreamFin                           │
+├──────────────────────────────────────────┤
+│  L2  GhostFrame   — DID addressing +    │
+│      hash-chain self-authentication      │
+│      Magic "GPF1" | type | flags |       │
+│      did_src | did_dst | chain_seq |     │
+│      chain_tag | payload_len | payload   │
+├──────────────────────────────────────────┤
+│  L1  Substrate    — any byte carrier     │
+│      current: UdpSubstrate (tech-val)    │
+│      planned: XDP, LoRa, raw 802.11      │
+└──────────────────────────────────────────┘
+```
+
+### L2 Wire Layout (little-endian, 34-byte header)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | Magic: `GPF1` (0x47 0x50 0x46 0x31) |
+| 4 | 1 | `frame_type`: `Knock=0x01` `Data=0x02` `Ctrl=0x03` `Ack=0x04` `Fin=0x05` |
+| 5 | 1 | `flags` (reserved, must be 0) |
+| 6 | 2 | reserved |
+| 8 | 4 | `did_src` (u32 LE) |
+| 12 | 4 | `did_dst` (u32 LE) |
+| 16 | 8 | `chain_seq` (u64 LE, descending — replay protection) |
+| 24 | 8 | `chain_tag` (u64 LE, SipHash-2-4 proof over `H_{chain_seq}`) |
+| 32 | 2 | `payload_len` (u16 LE) |
+| 34 | N | payload |
+
+### L3 Wire Layout (little-endian, 5-byte header, inside L2 payload)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 2 | `stream_id` (u16 LE) |
+| 2 | 1 | `session_type`: `PtyData=0x01` `PtyResize=0x02` `Meta=0x03` `StreamFin=0x04` |
+| 3 | 2 | `payload_len` (u16 LE) |
+| 5 | N | payload |
+
+### Self-authenticating frames
+
+Every Ghost Frame is self-authenticating: the `chain_tag` is a SipHash-2-4 HMAC over `H_{chain_seq}` using the shared SPA seed. The receiver validates this at L2 without requiring a prior TLS handshake. The `Knock` frame IS the authentication step — equivalent to SPA v2 in the existing XDP path.
+
+### Mapping to existing primitives
+
+| Ghost Protocol | Existing implementation |
+|----------------|------------------------|
+| `Knock` frame | SPA v2 UDP payload |
+| `Data` channel | QUIC connection |
+| L3 Session | QUIC streams + `ControlMessage` |
+| DID addressing | u32 DID from X.509 CN |
+| Self-certification | hash-chain + GCv3 state file |
 
 ---
 

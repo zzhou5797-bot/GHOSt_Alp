@@ -99,6 +99,66 @@ sudo server --bootstrap-peers /ip4/<B_IP>/tcp/<PORT>/p2p/<B_PEER_ID>
 
 ---
 
+## 🟢 Phase 3.5: Ghost Protocol 正式化 (Protocol Formalisation) - [✅ 已完成]
+
+**目标**: 将 GhostPTY 的核心原语（SPA 哈希链、DID 寻址、QUIC 流复用）提升为一个可独立描述的三层协议规范，并提供编解码实现和真实 UDP 集成测试。
+
+### Milestone 3.5.1: Ghost Protocol L2/L3 编解码器 ✅
+
+**实现**: `shared/src/gp_frame.rs`（473行）
+
+协议三层分离：
+
+```
+L3  SessionFrame  — stream_id 复用 + PTY_DATA / PTY_RESIZE / META / STREAM_FIN
+L2  GhostFrame    — DID 寻址 + 哈希链自证明，Magic "GPF1"，34字节固定头
+L1  Substrate     — 任意字节载体 trait（当前实现：UdpSubstrate UDP tech-val）
+```
+
+**L2 帧格式**（小端序）：
+
+| 偏移 | 字节 | 字段 |
+|------|------|------|
+| 0 | 4 | Magic `GPF1` |
+| 4 | 1 | `frame_type`: Knock=0x01 / Data=0x02 / Ctrl=0x03 / Ack=0x04 / Fin=0x05 |
+| 5 | 1 | `flags`（保留，必须为0） |
+| 6 | 2 | reserved |
+| 8 | 4 | `did_src`（u32 LE） |
+| 12 | 4 | `did_dst`（u32 LE） |
+| 16 | 8 | `chain_seq`（u64 LE，降序，防重放） |
+| 24 | 8 | `chain_tag`（u64 LE，SipHash-2-4 证明） |
+| 32 | 2 | `payload_len`（u16 LE） |
+| 34 | N | payload |
+
+**与现有协议的映射关系**：
+
+| Ghost Protocol | 现有实现 |
+|----------------|---------|
+| `Knock` 帧 | SPA v2 UDP payload |
+| `Data` 信道 | QUIC connection |
+| L3 Session | QUIC streams + `ControlMessage` |
+| DID 寻址 | u32 DID（X.509 CN 解析） |
+| 自证明身份 | 哈希链 + GCv3 state file（O(1)） |
+
+### Milestone 3.5.2: 真实 UDP 集成测试 ✅
+
+**实现**: `ghost-chain-tests/src/lib.rs` 模块 `gp_udp_integration`（4个测试）
+
+所有测试在真实 loopback UDP socket 上执行，无 mock：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `gp_udp_knock_roundtrip` | L2 Knock 帧全字段编解码 + UDP 传输 |
+| `gp_udp_data_with_session_frame_roundtrip` | L2 Data + L3 PtyData 完整双层解码 |
+| `gp_udp_knock_ack_bidirectional` | A→B Knock + B→A Ack 全双工请求应答 |
+| `gp_udp_resize_roundtrip` | L3 PtyResize rows/cols 精确保真传输 |
+
+测试覆盖了：encode → kernel UDP 路径 → decode → 字段断言，整条链路无一步跳过。
+
+**总测试数**: 25（哈希链/quota）+ 8（codec 单元）+ 4（真实 UDP 集成）= **37/37 通过**
+
+---
+
 ## ⚫ Phase 4: 黑暗森林与价值收割 (The Dark Forest)
 
 **目标**: 技术底座大成，开启基于密码学和物理法则的降维打击商业变现。
