@@ -152,6 +152,11 @@ cargo build --workspace --exclude gateway-ebpf
 
 ### Certificates
 
+> **WARNING**: The `certs/` directory contains **self-signed development-only test certificates**.
+> They are tracked in git solely to allow zero-configuration local testing.
+> **Never use these certificates in production.** Generate your own CA and sign fresh server/client
+> certificates for any real deployment.
+
 ```bash
 # Generate CA + server cert + client cert
 # (see certs/ directory for scripts)

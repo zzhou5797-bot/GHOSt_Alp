@@ -18,7 +18,11 @@ server/sovereign/gp_sovereign.o
 # Committing this would allow replay attacks.
 .ghost_chain_state
 
+# Internal development notes — not for public consumption
+task.md
+
 # TLS private keys — test certs in certs/ are acceptable, but never commit real keys
 *.key
 # Exception: the example test keys in certs/ are intentionally tracked for local dev
 !certs/*.key
+task.md
