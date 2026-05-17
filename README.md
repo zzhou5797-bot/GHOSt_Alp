@@ -2,27 +2,34 @@
 
 > **Open-source release** — [github.com/zzhou5797-bot/GHOSt_Alp](https://github.com/zzhou5797-bot/GHOSt_Alp) · Apache-2.0 · Alpha
 
-**A remote terminal that does not exist on the network until you prove who you are — with no CA, no coordination server, no cloud provider in the path.**
+**A communication protocol and remote terminal that does not require TCP/IP infrastructure — no routable IP address, no CA, no DNS, no coordination server.**
 
-`nmap` shows nothing. Shodan finds nothing. The server is running and accepting connections. This is not a firewall rule. This is cryptography at the NIC layer.
+`nmap` shows nothing. Shodan finds nothing. The server is running. This is not a firewall rule. This is cryptography at the NIC layer, before IP.
 
 ---
 
 ## Why This Exists
 
-Every mainstream remote access tool — SSH, Tailscale, Teleport, Cloudflare Tunnel — makes one shared assumption: something must be reachable before authentication happens. An open port, a coordination server, an edge node. That reachable thing is your attack surface, and it belongs to someone: you, your cloud provider, or a third-party network operator.
+TCP/IP is not just a protocol. It is a system built on centralized institutions:
 
-GhostPTY is built around a different premise:
+- **IP addresses** are allocated by IANA → regional RIRs → ISPs. Your address is a lease, not property.
+- **Routing** is BGP — a system where any AS can advertise any prefix, and the internet routes through it until someone notices. Trust-based by design.
+- **Names** are DNS — controlled by ICANN and a hierarchy of registrars that can be legally compelled.
+- **Identity** is PKI — your TLS certificate is blessed by a CA that can be compromised, coerced, or simply go out of business.
 
-> **Identity should be proved by math, not issued by institutions. Infrastructure should be owned by its operators, not rented from platforms.**
+Every tool built on top of TCP/IP inherits all of these dependencies. Tailscale routes through coordination servers on AWS. Cloudflare Tunnel routes through Cloudflare's AS. Your self-hosted VPN still needs a routable IP and a CA-signed certificate for anyone to trust it. You have moved the centralization around, not eliminated it.
 
-Concretely this means:
-- **No CA required for authentication** — the hash-chain knock proves identity before any TLS session exists
-- **No coordination server** — nodes discover each other via libp2p; there is no central registry
-- **No cloud dependency** — the protocol is designed to run over UDP, LoRa, raw 802.11 frames, or serial links; if the internet is unavailable, the protocol still works
-- **No single point of revocation** — kicking a node off the network requires BFT consensus across the mesh, not a unilateral decision by any one operator
+**GhostPTY is an attempt to build a layer underneath TCP/IP's assumptions.**
 
-This is a remote terminal today. The Ghost Protocol underneath it is designed for a world where you cannot assume the current internet infrastructure will be available, neutral, or trustworthy.
+> **Identity is proved by math, not issued by institutions. A node's existence on the network is not contingent on any third party's cooperation.**
+
+The Ghost Protocol (L1/L2/L3) is designed so that:
+- **Authentication requires no CA and no prior channel** — a hash-chain proof embedded in a single frame is sufficient
+- **Addressing requires no DNS and no routable IP** — nodes are addressed by DID (a u32 derived from a hash chain), not by IP
+- **The link layer is pluggable** — the same protocol frames run over UDP today, and over raw 802.11, LoRa, or serial tomorrow. If the internet goes away, the protocol keeps working
+- **Revocation requires consensus** — no single operator can unilaterally remove a node; BFT multi-signature voting is required
+
+GhostPTY is a remote terminal built on this protocol. The terminal is the proof of concept. The protocol is the point.
 
 ---
 
@@ -80,17 +87,28 @@ This is a remote terminal today. The Ghost Protocol underneath it is designed fo
 
 ---
 
-## How GhostPTY Differs
+## The Problem with Building on TCP/IP
 
-| | SSH | Tailscale | Teleport | Cloudflare Tunnel | **GhostPTY** |
-|---|---|---|---|---|---|
-| Network-visible before auth | Yes | Yes (tailnet) | Yes (HTTPS) | Yes (edge) | **No — XDP drops everything** |
-| Depends on third-party infra | No | Their cloud | Your server | Their edge | **No** |
-| Clock / NTP dependency | No | Yes | Yes | Yes | **No — hash chain** |
-| Identity issued by | CA | Their accounts | CA | Their CA | **Hash chain, no CA for knock** |
-| Kernel-layer enforcement | No | No | No | No | **Yes — XDP, pre-IP-stack** |
-| Works without internet | No | No | No | No | **Yes — LoRa / raw 802.11 planned** |
-| Revocation requires consensus | No | No | No | No | **Yes — BFT multi-sig** |
+Every tool in this space is built on top of TCP/IP and inherits its centralized dependencies:
+
+| Dependency | Who controls it | What happens if they act against you |
+|------------|----------------|--------------------------------------|
+| IP address | IANA → RIR → ISP | Address revoked, traffic rerouted |
+| BGP routing | Tier-1 ASes | Route hijack (this has happened) |
+| DNS name | ICANN → registrar | Domain seized or suspended |
+| TLS certificate | CA (Let's Encrypt, DigiCert…) | Certificate revoked, HTTPS breaks |
+| Cloud infra | AWS / GCP / Azure | Account terminated, endpoints gone |
+
+Ghost Protocol is designed to not require any of these. A node is identified by a DID derived from a hash chain — no RIR, no registrar, no CA involved. The link layer is pluggable — no assumption that IP routing is available.
+
+| | Tailscale | Cloudflare Tunnel | WireGuard (self-hosted) | **GhostPTY / Ghost Protocol** |
+|---|---|---|---|---|
+| Requires routable IP | Yes | Yes | Yes | **No (DID addressing)** |
+| Requires CA / PKI | Yes | Yes | Yes (for trust) | **No for L2 auth** |
+| Requires coordination server | Yes (their cloud) | Yes (their edge) | No | **No** |
+| Requires internet (TCP/IP) | Yes | Yes | Yes | **No — LoRa / 802.11 / serial** |
+| Kernel-layer enforcement | No | No | No | **Yes — XDP before IP stack** |
+| Revocation by consensus | No | No | No | **Yes — BFT multi-sig** |
 
 ---
 
