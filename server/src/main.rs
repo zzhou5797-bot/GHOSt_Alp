@@ -223,33 +223,35 @@ async fn main() -> Result<()> {
 
     // Sovereign ring-buffer task.
     // Reads raw packets forwarded by the XDP sovereign filter (not in this repo).
-    // When the ring buffer is empty (no filter installed), this task is a no-op.
+    // When the ring buffer is absent (no filter installed), this task is a no-op.
     {
-        let sv_rb = RingBuf::try_from(
-            unsafe { &mut *bpf_ptr }
-                .take_map("SOVEREIGN_RB")
-                .ok_or_else(|| anyhow::anyhow!("SOVEREIGN_RB not found"))?,
-        )?;
-        let sv_vs = Arc::clone(&validator_set);
-        tokio::spawn(async move {
-            let mut sv_rb = sv_rb;
-            loop {
-                while let Some(item) = sv_rb.next() {
-                    if item.len() < std::mem::size_of::<SovereignItem>() {
-                        continue;
+        let maybe_map = unsafe { &mut *bpf_ptr }.take_map("SOVEREIGN_RB");
+        if maybe_map.is_none() {
+            tracing::warn!("SOVEREIGN_RB not found — sovereign filter task disabled (no-op).");
+        }
+        if let Some(map) = maybe_map {
+            let sv_rb = RingBuf::try_from(map)?;
+            let sv_vs = Arc::clone(&validator_set);
+            tokio::spawn(async move {
+                let mut sv_rb = sv_rb;
+                loop {
+                    while let Some(item) = sv_rb.next() {
+                        if item.len() < std::mem::size_of::<SovereignItem>() {
+                            continue;
+                        }
+                        let sv: SovereignItem = unsafe {
+                            std::ptr::read_unaligned(item.as_ptr() as *const SovereignItem)
+                        };
+                        // Clamp sv.len to the actual data array length to prevent over-reads.
+                        let data_len = (sv.len as usize).min(sv.data.len());
+                        let data = &sv.data[..data_len];
+                        let mut vs = sv_vs.write().await;
+                        sovereign::apply(data, &mut *vs);
                     }
-                    let sv: SovereignItem = unsafe {
-                        std::ptr::read_unaligned(item.as_ptr() as *const SovereignItem)
-                    };
-                    // Clamp sv.len to the actual data array length to prevent over-reads.
-                    let data_len = (sv.len as usize).min(sv.data.len());
-                    let data = &sv.data[..data_len];
-                    let mut vs = sv_vs.write().await;
-                    sovereign::apply(data, &mut *vs);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-        });
+            });
+        }
     }
 
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
