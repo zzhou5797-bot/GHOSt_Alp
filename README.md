@@ -80,20 +80,6 @@ This is a remote terminal today. The Ghost Protocol underneath it is designed fo
 
 ---
 
-## How GhostPTY Differs
-
-| | SSH | Tailscale | Teleport | Cloudflare Tunnel | **GhostPTY** |
-|---|---|---|---|---|---|
-| Network-visible before auth | Yes | Yes (tailnet) | Yes (HTTPS) | Yes (edge) | **No — XDP drops everything** |
-| Depends on third-party infra | No | Their cloud | Your server | Their edge | **No** |
-| Clock / NTP dependency | No | Yes | Yes | Yes | **No — hash chain** |
-| Identity issued by | CA | Their accounts | CA | Their CA | **Hash chain, no CA for knock** |
-| Kernel-layer enforcement | No | No | No | No | **Yes — XDP, pre-IP-stack** |
-| Works without internet | No | No | No | No | **Yes — LoRa / raw 802.11 planned** |
-| Revocation requires consensus | No | No | No | No | **Yes — BFT multi-sig** |
-
----
-
 ## How a Session Is Established
 
 1. **SPA knock** — The client sends a single UDP packet to port 8080 containing a `SpaPayload` (magic, version, DID subject, descending sequence number, SipHash-2-4 chain tag). The XDP program verifies the chain, updates `AUTH_STATE_MAP`, binds the client IP in `ALLOW_LIST_MAP`, and silently drops the knock packet.
