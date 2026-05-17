@@ -335,3 +335,6 @@ A plain HTTP server listens on `:8081`. `GET /` returns `200 OK`. Suitable for K
 ## License
 
 See [LICENSE](LICENSE).
+
+
+<img width="859" height="407" alt="image" src="https://github.com/user-attachments/assets/adae57f1-f28d-49ac-bd72-054513220d8b" />
