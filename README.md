@@ -1,8 +1,28 @@
 # GhostPTY
 
-> **Open-source release** — hosted at [github.com/zzhou5797-bot/GHOSt_Alp](https://github.com/zzhou5797-bot/GHOSt_Alp)
+> **Open-source release** — [github.com/zzhou5797-bot/GHOSt_Alp](https://github.com/zzhou5797-bot/GHOSt_Alp) · Apache-2.0 · Alpha
 
-GhostPTY is a zero-trust, kernel-enforced remote terminal gateway built in Rust. It combines QUIC transport, eBPF kernel programs, and a libp2p gossip network to provide authenticated, metered, and audited PTY sessions with no exposure of traditional listening ports.
+**A remote terminal that does not exist on the network until you prove who you are — with no CA, no coordination server, no cloud provider in the path.**
+
+`nmap` shows nothing. Shodan finds nothing. The server is running and accepting connections. This is not a firewall rule. This is cryptography at the NIC layer.
+
+---
+
+## Why This Exists
+
+Every mainstream remote access tool — SSH, Tailscale, Teleport, Cloudflare Tunnel — makes one shared assumption: something must be reachable before authentication happens. An open port, a coordination server, an edge node. That reachable thing is your attack surface, and it belongs to someone: you, your cloud provider, or a third-party network operator.
+
+GhostPTY is built around a different premise:
+
+> **Identity should be proved by math, not issued by institutions. Infrastructure should be owned by its operators, not rented from platforms.**
+
+Concretely this means:
+- **No CA required for authentication** — the hash-chain knock proves identity before any TLS session exists
+- **No coordination server** — nodes discover each other via libp2p; there is no central registry
+- **No cloud dependency** — the protocol is designed to run over UDP, LoRa, raw 802.11 frames, or serial links; if the internet is unavailable, the protocol still works
+- **No single point of revocation** — kicking a node off the network requires BFT consensus across the mesh, not a unilateral decision by any one operator
+
+This is a remote terminal today. The Ghost Protocol underneath it is designed for a world where you cannot assume the current internet infrastructure will be available, neutral, or trustworthy.
 
 ---
 
@@ -60,6 +80,20 @@ GhostPTY is a zero-trust, kernel-enforced remote terminal gateway built in Rust.
 
 ---
 
+## How GhostPTY Differs
+
+| | SSH | Tailscale | Teleport | Cloudflare Tunnel | **GhostPTY** |
+|---|---|---|---|---|---|
+| Network-visible before auth | Yes | Yes (tailnet) | Yes (HTTPS) | Yes (edge) | **No — XDP drops everything** |
+| Depends on third-party infra | No | Their cloud | Your server | Their edge | **No** |
+| Clock / NTP dependency | No | Yes | Yes | Yes | **No — hash chain** |
+| Identity issued by | CA | Their accounts | CA | Their CA | **Hash chain, no CA for knock** |
+| Kernel-layer enforcement | No | No | No | No | **Yes — XDP, pre-IP-stack** |
+| Works without internet | No | No | No | No | **Yes — LoRa / raw 802.11 planned** |
+| Revocation requires consensus | No | No | No | No | **Yes — BFT multi-sig** |
+
+---
+
 ## How a Session Is Established
 
 1. **SPA knock** — The client sends a single UDP packet to port 8080 containing a `SpaPayload` (magic, version, DID subject, descending sequence number, SipHash-2-4 chain tag). The XDP program verifies the chain, updates `AUTH_STATE_MAP`, binds the client IP in `ALLOW_LIST_MAP`, and silently drops the knock packet.
@@ -114,7 +148,9 @@ Slash votes are verified with `verify_slash_signature()` against the live `Valid
 
 ### ValidatorSet (Tier-1 Governance)
 
-`ValidatorSet` holds the Tier-1 genesis signing keys, slash voter pubkeys, BFT threshold, and the network pause flag. It is initialized from compile-time bootstrap constants and mutated at runtime through the gossipsub slash consensus path. Governance of the validator set itself is handled by a separate closed-source mechanism with no network-visible entry point.
+`ValidatorSet` holds the Ed25519 genesis signing keys, slash voter pubkeys, BFT threshold, and the network pause flag. It is initialized from compile-time bootstrap constants and mutated at runtime through the gossipsub slash consensus path.
+
+Governance of the `ValidatorSet` itself — adding or removing Tier-1 keys — is an on-chain operation outside this repository. The design intent is that no single party, including the original authors, can unilaterally modify the validator set: doing so requires the same BFT threshold as any other governance action. The current bootstrap set is embedded in `server/src/genesis.rs` and is visible in the open-source code.
 
 ---
 
@@ -133,7 +169,9 @@ Slash votes are verified with `verify_slash_signature()` against the live `Valid
 
 ## Ghost Protocol
 
-GhostPTY implements a three-layer substrate-agnostic protocol for authenticated, self-certifying communication. The Ghost Protocol is implemented in `shared::gp_frame`.
+GhostPTY is built on top of the **Ghost Protocol** — a substrate-agnostic, three-layer communication protocol designed for a post-centralized-internet environment.
+
+The core design goal: **a node should be able to prove its identity to another node and establish a secure channel using only shared cryptographic state, with no reliance on any third-party infrastructure.** No CA, no DNS, no NTP, no coordination server.
 
 ```
 ┌──────────────────────────────────────────┐
@@ -141,17 +179,43 @@ GhostPTY implements a three-layer substrate-agnostic protocol for authenticated,
 │      PtyData / PtyResize / Meta /        │
 │      StreamFin                           │
 ├──────────────────────────────────────────┤
-│  L2  GhostFrame   — DID addressing +    │
+│  L2  GhostFrame   — DID addressing +     │
 │      hash-chain self-authentication      │
 │      Magic "GPF1" | type | flags |       │
 │      did_src | did_dst | chain_seq |     │
 │      chain_tag | payload_len | payload   │
 ├──────────────────────────────────────────┤
 │  L1  Substrate    — any byte carrier     │
-│      current: UdpSubstrate (tech-val)    │
-│      planned: XDP, LoRa, raw 802.11      │
+│      current: UdpSubstrate               │
+│      planned: raw 802.11, LoRa, serial   │
 └──────────────────────────────────────────┘
 ```
+
+### L1 — Substrate: why it matters
+
+The `Substrate` trait abstracts the link layer down to two operations: `send(dst: &[u8], bytes)` and `recv() -> (src, bytes)`. The address is opaque bytes — an IPv4+port tuple for UDP, a MAC address for raw 802.11, a device ID for LoRa.
+
+This means Ghost Protocol is not tied to IP networking. Planned implementations:
+
+| Substrate | Use case |
+|-----------|----------|
+| `UdpSubstrate` | Standard IP networks (current) |
+| `XdpSubstrate` | Bypass kernel IP stack entirely via AF_XDP |
+| `Ieee80211Substrate` | Direct node-to-node over raw 802.11 Ad-hoc frames, no AP, no DHCP |
+| `LoraSubstrate` | Off-grid, long-range ISM-band radio, no SIM card, no carrier |
+| `SerialSubstrate` | Cross-domain links across physically isolated networks |
+
+If your ISP goes down, if BGP is hijacked, if you are managing infrastructure in a location without internet connectivity — the protocol still runs, as long as two nodes can exchange bytes by any means.
+
+### L2 — GhostFrame: self-certifying identity
+
+Every L2 frame is self-authenticating. The `chain_tag` field is a SipHash-2-4 HMAC over `H_{chain_seq}` derived from the shared SPA seed:
+
+```
+chain_tag = SipHash-2-4(H_{chain_seq}, shared_seed)
+```
+
+The receiver can verify the sender's identity at L2 before any TLS session exists. The `Knock` frame IS the authentication — not a precursor to it. There is no CA involved in this step.
 
 ### L2 Wire Layout (little-endian, 34-byte header)
 
@@ -177,21 +241,17 @@ GhostPTY implements a three-layer substrate-agnostic protocol for authenticated,
 | 3 | 2 | `payload_len` (u16 LE) |
 | 5 | N | payload |
 
-### Self-authenticating frames
-
-Every Ghost Frame is self-authenticating: the `chain_tag` is a SipHash-2-4 HMAC over `H_{chain_seq}` using the shared SPA seed. The receiver validates this at L2 without requiring a prior TLS handshake. The `Knock` frame IS the authentication step — equivalent to SPA v2 in the existing XDP path.
-
 ### Mapping to existing primitives
 
-| Ghost Protocol | Existing implementation |
+| Ghost Protocol | Current implementation |
 |----------------|------------------------|
-| `Knock` frame | SPA v2 UDP payload |
+| `Knock` frame | SPA v2 UDP payload (XDP-verified) |
 | `Data` channel | QUIC connection |
 | L3 Session | QUIC streams + `ControlMessage` |
-| DID addressing | u32 DID from X.509 CN |
-| Self-certification | hash-chain + GCv3 state file |
+| DID addressing | u32 DID parsed from mTLS X.509 CN |
+| Hash-chain proof | SipHash-2-4 chain in `gateway-ebpf` |
 
----
+> **Note on the mTLS layer**: the QUIC connection (post-knock) still uses X.509 certificates for mutual TLS. These require a CA. The hash-chain authentication at L2 is CA-free and operates before the TLS session; the X.509 layer provides an additional binding between the DID and a certificate. In future Substrate implementations (e.g. LoRa) the QUIC/TLS layer would be replaced by a lighter-weight construction using only the L2 chain-tag proof.
 
 ## Building
 
@@ -237,7 +297,15 @@ cargo run -p client -- --server 1.2.3.4:8080 --token <token>
 
 ---
 
-## Key Configuration
+---
+
+## Operational Notes
+
+### Health Probe
+
+A plain HTTP server listens on `:8081`. `GET /` returns `200 OK`. Suitable for Kubernetes liveness/readiness probes or any external health-check system. Limited to 10 concurrent connections.
+
+### Key Configuration
 
 | Flag / Env | Default | Description |
 |------------|---------|-------------|
@@ -249,12 +317,6 @@ cargo run -p client -- --server 1.2.3.4:8080 --token <token>
 | `GATEWAY_TOKEN` | _(required, no default)_ | Bearer token checked in handshake — must be set; server refuses to start without it |
 | `--bootstrap-peers` | _(none)_ | Comma-separated libp2p multiaddrs for P2P mesh |
 | `DEV_PRIV_KEY` | _(none)_ | Hex-encoded Ed25519 key for signing slash votes |
-
----
-
-## Health Probe
-
-A plain HTTP server listens on `:8081`. `GET /` returns `200 OK`. Suitable for Kubernetes liveness/readiness probes. Limited to 10 concurrent connections.
 
 ---
 
