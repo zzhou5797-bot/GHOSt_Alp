@@ -1,6 +1,31 @@
 #![no_std]
 #![no_main]
 
+//! GhostPTY XDP + tracepoint kernel programs.
+//!
+//! ## XDP program (`gateway_ebpf`)
+//!
+//! Attached to the gateway network interface; processes every inbound UDP
+//! packet destined for port 8080 before the kernel's network stack sees it.
+//!
+//! Decision tree per packet:
+//!
+//! 1. Non-IPv4 / non-UDP → `XDP_PASS` (let kernel handle it)
+//! 2. IP is in `ALLOW_LIST_MAP` → token-bucket check → `XDP_PASS` or `XDP_DROP`
+//! 3. UDP payload too short for `SpaPayload` → `XDP_DROP`
+//! 4. Magic mismatch → `XDP_DROP`
+//! 5. Version == 1 → `handle_v1_knock` (timestamp path) → `XDP_DROP`
+//! 6. Version == 2 → SipHash-2-4 chain verification → bind IP → `XDP_DROP`
+//!
+//! All SPA knock packets are dropped silently.  Only the subsequent QUIC
+//! connection (from a now-whitelisted IP) receives `XDP_PASS`.
+//!
+//! ## Tracepoint (`audit_execve`)
+//!
+//! Attached to `syscalls/sys_enter_execve`.  Fires only for processes whose
+//! cgroup ID is in `AUDIT_CGROUP_MAP`; emits an `AuditEvent` via
+//! `AUDIT_EVENTS` (perf event array) to the userspace per-CPU readers.
+
 use core::panic::PanicInfo;
 
 #[panic_handler]
@@ -9,19 +34,21 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 use aya_ebpf::macros::map;
-use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerfEventArray};
+use aya_ebpf::maps::{Array, HashMap, LruHashMap, PerfEventArray, RingBuf};
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::{bpf_get_current_pid_tgid, bpf_get_current_uid_gid},
     macros::{tracepoint, xdp},
     programs::{TracePointContext, XdpContext},
 };
-use gateway_ebpf_common::{AuditEvent, AuthState, SpaPayload, SpaPayloadV1};
+use gateway_ebpf_common::{AuditEvent, AuthState, SovereignItem, SpaPayload, SpaPayloadV1};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
     udp::UdpHdr,
 };
+
+// ── BPF maps ─────────────────────────────────────────────────────────────────
 
 #[map]
 static AUTH_STATE_MAP: HashMap<u32, AuthState> = HashMap::with_max_entries(1024, 0);
@@ -32,21 +59,27 @@ static ALLOW_LIST_MAP: HashMap<u32, u32> = HashMap::with_max_entries(1024, 0);
 #[map]
 static AUDIT_EVENTS: PerfEventArray<AuditEvent> = PerfEventArray::new(0);
 
-// Cgroup ID allowlist: only sessions whose cgroup_id is in this map will emit audit events
+/// Cgroup ID allowlist: only sessions present in this map emit audit events.
 #[map]
 static AUDIT_CGROUP_MAP: HashMap<u64, u8> = HashMap::with_max_entries(256, 0);
 
-// ── v1 backward-compat maps (dual-stack transition period only) ─────────────
-// TIME_DELTA_MAP[0] = UNIX_ns − ktime_ns offset, written by server at startup.
+/// Ring buffer for internal governance packets forwarded by the XDP sovereign
+/// filter.  The filter that writes here is not part of this repository; without
+/// it this map is always empty.
+#[map]
+static SOVEREIGN_RB: RingBuf = RingBuf::with_byte_size(4096, 0);
+
+/// `TIME_DELTA_MAP[0]` = (UNIX_ns − ktime_ns) offset written by the server at
+/// startup.  Required by the v1 knock handler to convert ktime to wall time.
 #[map]
 static TIME_DELTA_MAP: Array<u64> = Array::with_max_entries(1, 0);
 
-// REPLAY_FILTER_MAP: LRU of seen v1 timestamps to prevent replay attacks.
-// Each entry is (timestamp_ns → 1). LRU capacity = 4096 entries ≈ 4096 unique knocks.
+/// LRU table of seen v1 timestamps used to prevent replay attacks.
+/// Capacity 4096 entries; oldest are evicted automatically by the kernel.
 #[map]
 static REPLAY_FILTER_MAP: LruHashMap<u64, u8> = LruHashMap::with_max_entries(4096, 0);
 
-// Subject ID used for v1 (legacy) sessions — all share a single AuthState slot.
+/// Synthetic subject ID assigned to all v1 (legacy) sessions.
 const V1_SUBJECT: u32 = 0xFFFF_FFFE;
 
 #[inline(always)]
@@ -171,11 +204,11 @@ fn handle_v1_knock(ctx: &XdpContext, payload_offset: usize, ipv4_source: u32) ->
     let v1_auth = AuthState {
         expected_seq: 0,
         anchor_hash_lo: 0,
-        bucket_tokens: 1, // One-shot: enough for the QUIC handshake
+        bucket_tokens: 1, // One-shot token: sufficient for the initial QUIC handshake.
         last_refill_ns: ktime_ns,
-        quota_bytes: 1_000_000_000,
+        quota_bytes: 1_000_000_000, // 1 GiB default quota for legacy sessions.
         last_seen_quota_seq: 0,
-        revoked: 0, // 1 GiB default quota for legacy sessions
+        revoked: 0,
     };
     let _ = unsafe { AUTH_STATE_MAP.insert(&V1_SUBJECT, &v1_auth, 0) };
 
@@ -222,10 +255,9 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_PASS);
     }
 
-    // ── Hot path: Token-Bucket rate limiter for authorized QUIC traffic ──────
-    // For every known-authorized IP, refill tokens based on elapsed kernel time,
-    // then deduct one token per packet. If the bucket is empty, XDP_DROP.
-    // This prevents spoofed-IP floods from consuming user-space quota.
+    // ── Hot path: token-bucket rate limiter for already-authorized IPs ─────
+    // Refill tokens based on elapsed kernel time, then deduct one per packet.
+    // XDP_DROP on empty bucket prevents spoofed-IP floods from reaching Quinn.
     if let Some(user_id) = unsafe { ALLOW_LIST_MAP.get(&ipv4_source) } {
         let state_ptr = match unsafe { AUTH_STATE_MAP.get_ptr_mut(user_id) } {
             Some(p) => p,
@@ -285,12 +317,12 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
     let version =
         u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).version)) });
 
-    // ── Version Discriminator: route to the correct SPA verification path ────────
+    // ── Version discriminator: route to the correct SPA verification path ──
     if version == SpaPayloadV1::VERSION {
         return handle_v1_knock(&ctx, payload_offset, ipv4_source);
     }
 
-    // ── V2: Hash Chain path (current) ────────────────────────────────────────────
+    // ── V2 hash-chain path ────────────────────────────────────────────────
     let subject =
         u32::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*payload).subject)) });
     let seq =
@@ -305,7 +337,7 @@ fn try_gateway_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 
     let mut auth_state = unsafe { core::ptr::read_volatile(auth_state_ptr) };
 
-    // ── Phase 3.3 & 3.4 0-Day Immunity ──────────────────────────────────────
+    // Revocation check: if the subject has been slashed, drop at NIC speed.
     if auth_state.revoked > 0 {
         return Ok(xdp_action::XDP_DROP); // Subject is slashed, kill connection at NIC
     }

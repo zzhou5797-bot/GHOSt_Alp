@@ -282,3 +282,278 @@ fn test_bucket_throttles_flood() {
         "Remaining flood packets must be dropped"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Genesis Credential tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod genesis_tests {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+    use shared::GenesisCredential;
+
+    fn sign_credential(sk: &SigningKey, vc: &GenesisCredential) -> String {
+        let anchor_hex: String = vc.anchor_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let msg = format!("{}:{}:{}", vc.subject, vc.request_quota, anchor_hex);
+        let sig = sk.sign(msg.as_bytes());
+        hex::encode(sig.to_bytes())
+    }
+
+    /// A correctly signed GenesisCredential should deserialise and re-sign cleanly.
+    #[test]
+    fn test_genesis_credential_roundtrip() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let anchor = [0u8; 32];
+
+        let mut vc = GenesisCredential {
+            subject: 42,
+            request_quota: 1_000_000,
+            pubkey_index: 0,
+            anchor_hash: anchor,
+            signature_hex: String::new(),
+        };
+        vc.signature_hex = sign_credential(&sk, &vc);
+
+        // Verify the message format ourselves (mirrors genesis.rs verify_genesis_credential)
+        let anchor_hex: String = vc.anchor_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let msg = format!("{}:{}:{}", vc.subject, vc.request_quota, anchor_hex);
+        let mut sig_bytes = [0u8; 64];
+        hex::decode_to_slice(&vc.signature_hex, &mut sig_bytes).unwrap();
+
+        use ed25519_dalek::Verifier;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let vk = sk.verifying_key();
+        assert!(vk.verify(msg.as_bytes(), &sig).is_ok(), "Signature must verify");
+    }
+
+    /// Tampered `request_quota` must invalidate the signature.
+    #[test]
+    fn test_genesis_credential_tampered_quota_rejected() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let anchor = [0x11u8; 32];
+
+        let mut vc = GenesisCredential {
+            subject: 1,
+            request_quota: 500_000,
+            pubkey_index: 0,
+            anchor_hash: anchor,
+            signature_hex: String::new(),
+        };
+        vc.signature_hex = sign_credential(&sk, &vc);
+
+        // Tamper with quota after signing
+        vc.request_quota = 999_999_999;
+
+        let anchor_hex: String = vc.anchor_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let tampered_msg = format!("{}:{}:{}", vc.subject, vc.request_quota, anchor_hex);
+        let mut sig_bytes = [0u8; 64];
+        hex::decode_to_slice(&vc.signature_hex, &mut sig_bytes).unwrap();
+
+        use ed25519_dalek::Verifier;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        let vk = sk.verifying_key();
+        assert!(
+            vk.verify(tampered_msg.as_bytes(), &sig).is_err(),
+            "Tampered quota must fail verification"
+        );
+    }
+
+    /// Wrong pubkey cannot verify a credential signed by a different key.
+    #[test]
+    fn test_genesis_credential_wrong_key_rejected() {
+        let sk_real = SigningKey::generate(&mut OsRng);
+        let sk_wrong = SigningKey::generate(&mut OsRng);
+        let anchor = [0x22u8; 32];
+
+        let mut vc = GenesisCredential {
+            subject: 7,
+            request_quota: 10_000,
+            pubkey_index: 0,
+            anchor_hash: anchor,
+            signature_hex: String::new(),
+        };
+        vc.signature_hex = sign_credential(&sk_real, &vc);
+
+        let anchor_hex: String = vc.anchor_hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let msg = format!("{}:{}:{}", vc.subject, vc.request_quota, anchor_hex);
+        let mut sig_bytes = [0u8; 64];
+        hex::decode_to_slice(&vc.signature_hex, &mut sig_bytes).unwrap();
+
+        use ed25519_dalek::Verifier;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        // Verify against the WRONG key
+        let vk_wrong = sk_wrong.verifying_key();
+        assert!(
+            vk_wrong.verify(msg.as_bytes(), &sig).is_err(),
+            "Wrong verifying key must reject the signature"
+        );
+    }
+
+    /// JSON round-trip of GenesisCredential must preserve all fields exactly.
+    #[test]
+    fn test_genesis_credential_serde_roundtrip() {
+        let vc = GenesisCredential {
+            subject: 255,
+            request_quota: u64::MAX,
+            pubkey_index: 1,
+            anchor_hash: [0xABu8; 32],
+            signature_hex: "aa".repeat(32),
+        };
+        let json = serde_json::to_string(&vc).expect("serialise");
+        let vc2: GenesisCredential = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(vc.subject, vc2.subject);
+        assert_eq!(vc.request_quota, vc2.request_quota);
+        assert_eq!(vc.pubkey_index, vc2.pubkey_index);
+        assert_eq!(vc.anchor_hash, vc2.anchor_hash);
+        assert_eq!(vc.signature_hex, vc2.signature_hex);
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ControlMessage wire format tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod wire_format_tests {
+    use shared::ControlMessage;
+
+    #[test]
+    fn test_authenticate_serde() {
+        let msg = ControlMessage::Authenticate {
+            token: "hunter2".to_string(),
+            genesis_vc: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlMessage::Authenticate { token, genesis_vc } => {
+                assert_eq!(token, "hunter2");
+                assert!(genesis_vc.is_none());
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn test_resize_serde() {
+        let msg = ControlMessage::Resize { rows: 24, cols: 80 };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlMessage::Resize { rows, cols } => {
+                assert_eq!(rows, 24);
+                assert_eq!(cols, 80);
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn test_setenv_serde() {
+        let msg = ControlMessage::SetEnv {
+            key: "TERM".to_string(),
+            value: "xterm-256color".to_string(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            ControlMessage::SetEnv { key, value } => {
+                assert_eq!(key, "TERM");
+                assert_eq!(value, "xterm-256color");
+            }
+            _ => panic!("wrong variant after roundtrip"),
+        }
+    }
+
+    #[test]
+    fn test_startshell_serde() {
+        let msg = ControlMessage::StartShell;
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ControlMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ControlMessage::StartShell));
+    }
+
+    /// Unknown JSON variant must not silently produce a valid message.
+    #[test]
+    fn test_unknown_variant_rejected() {
+        let bad_json = r#"{"UnknownCommand":{"foo":"bar"}}"#;
+        let result: Result<ControlMessage, _> = serde_json::from_str(bad_json);
+        assert!(result.is_err(), "Unknown variant must fail to deserialise");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Quota accounting tests (mirrors the AtomicU64 guillotine in server/main.rs)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod quota_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const SYNC_THRESHOLD: u64 = 65_536; // mirrors server/src/main.rs
+
+    /// Simulates the guillotine check: consumed + bytes > quota → reject.
+    fn quota_check(consumed: &AtomicU64, bytes: u64, quota: u64) -> bool {
+        let prev = consumed.fetch_add(bytes, Ordering::Relaxed);
+        if prev + bytes > quota {
+            consumed.fetch_sub(bytes, Ordering::Relaxed); // roll back
+            false
+        } else {
+            true
+        }
+    }
+
+    #[test]
+    fn test_quota_allows_within_limit() {
+        let consumed = AtomicU64::new(0);
+        assert!(quota_check(&consumed, 1024, 1_000_000));
+        assert_eq!(consumed.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    fn test_quota_rejects_over_limit() {
+        let consumed = AtomicU64::new(999_500);
+        // 999_500 + 600 = 1_000_100 > 1_000_000 → must reject
+        assert!(!quota_check(&consumed, 600, 1_000_000));
+        // Consumed must be rolled back
+        assert_eq!(consumed.load(Ordering::Relaxed), 999_500);
+    }
+
+    #[test]
+    fn test_quota_exactly_at_limit_allowed() {
+        let consumed = AtomicU64::new(999_000);
+        // exactly at limit: 999_000 + 1_000 = 1_000_000 = quota → allowed (not >)
+        assert!(quota_check(&consumed, 1_000, 1_000_000));
+    }
+
+    #[test]
+    fn test_quota_sync_threshold_fires() {
+        let consumed = Arc::new(AtomicU64::new(0));
+        let last_sync = Arc::new(AtomicU64::new(0));
+
+        // Simulate writing 65_536 bytes in one shot
+        let c = consumed.fetch_add(SYNC_THRESHOLD, Ordering::Relaxed);
+        let prev_sync = last_sync.load(Ordering::Relaxed);
+        let synced = if c + SYNC_THRESHOLD - prev_sync >= SYNC_THRESHOLD {
+            last_sync.store(c + SYNC_THRESHOLD, Ordering::Relaxed);
+            true
+        } else {
+            false
+        };
+        assert!(synced, "Sync must trigger after consuming SYNC_THRESHOLD bytes");
+    }
+
+    #[test]
+    fn test_quota_sync_threshold_does_not_fire_early() {
+        let consumed = Arc::new(AtomicU64::new(0));
+        let last_sync = Arc::new(AtomicU64::new(0));
+
+        let chunk = SYNC_THRESHOLD - 1;
+        let c = consumed.fetch_add(chunk, Ordering::Relaxed);
+        let prev_sync = last_sync.load(Ordering::Relaxed);
+        let synced = c + chunk - prev_sync >= SYNC_THRESHOLD;
+        assert!(!synced, "Sync must NOT fire before SYNC_THRESHOLD bytes consumed");
+    }
+}

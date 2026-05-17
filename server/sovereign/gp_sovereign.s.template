@@ -1,0 +1,148 @@
+# gp_sovereign.s — Assembly template for the sovereign verification layer.
+#
+# THIS FILE IS A STRUCTURAL TEMPLATE ONLY.
+# The real gp_sovereign.s contains:
+#   - Three-dimensional key derivation constants (not here)
+#   - Custom auth-tag computation (not here)
+#   - Actual packet structure requirements (not here)
+#
+# Copy this file to gp_sovereign.s, fill in the marked sections,
+# then compile with:
+#   as -o gp_sovereign.o gp_sovereign.s && ar rcs libgp_sovereign.a gp_sovereign.o
+#
+# The real gp_sovereign.s and libgp_sovereign.a are listed in .gitignore
+# and must never be committed.
+#
+# ── Interface contract (System V AMD64 ABI) ───────────────────────────────────
+#
+#   gp_probe(buf: *const u8, len: usize, ts_ns: u64) -> i32
+#     rdi = buf pointer
+#     rsi = len (must be exactly GP_PACKET_LEN bytes)
+#     rdx = current UNIX time in nanoseconds
+#     return: 0 on accept, -1 on reject
+#     side effects: NONE — pure verification
+#     register contract: all caller-saved registers restored or cleared
+#
+#   gp_seal(buf: *const u8, len: usize, out: *mut SovereignResult) -> i32
+#     rdi = buf pointer (same packet that passed gp_probe)
+#     rsi = len
+#     rdx = pointer to SovereignResult (see sovereign.rs)
+#     return: 0 on success, -1 on failure
+#     side effects: fills *out with decoded action
+#     register contract: all scratch registers zeroed before return
+#
+# ── SovereignResult layout (repr(C)) ─────────────────────────────────────────
+#   offset  0: action_id    u32
+#   offset  4: u32_param    u32
+#   offset  8: bytes_param  [u8; 32]
+#   offset 40: str_len      u32
+#   offset 44: str_param    [u8; 64]
+#   total: 108 bytes
+#
+# ── Packet layout (GP_PACKET_LEN bytes) ──────────────────────────────────────
+#   Defined by the real implementation; not documented here.
+#
+# ── Three-dimensional key ────────────────────────────────────────────────────
+#   Dimension 1 — Temporal:    epoch = ts_ns / EPOCH_NS  (fill in EPOCH_NS)
+#   Dimension 2 — Structural:  derived from packet content
+#   Dimension 3 — Secret:      embedded constants (fill in below)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+.section .note.GNU-stack,"",@progbits
+.global gp_probe
+.global gp_seal
+.type   gp_probe, @function
+.type   gp_seal,  @function
+
+# ── Constants (FILL IN the real values before compiling) ─────────────────────
+.set GP_PACKET_LEN,  0        # TODO: exact required packet length in bytes
+.set EPOCH_NS,       0        # TODO: epoch length in nanoseconds (e.g. 30_000_000_000)
+.set SECRET_K0,      0        # TODO: 64-bit constant, dimension-3 key material lo
+.set SECRET_K1,      0        # TODO: 64-bit constant, dimension-3 key material hi
+.set AUTH_TAG_OFFSET,0        # TODO: byte offset of the auth tag within the packet
+.set AUTH_TAG_LEN,   0        # TODO: byte length of the auth tag
+
+# ── gp_probe ─────────────────────────────────────────────────────────────────
+gp_probe:
+    # Prologue
+    push    %rbx
+    push    %r12
+    push    %r13
+    push    %r14
+    push    %r15
+
+    mov     %rdi, %r12      # buf
+    mov     %rsi, %r13      # len
+    mov     %rdx, %r14      # ts_ns
+
+    # --- Step 1: Length check ------------------------------------------------
+    cmp     $GP_PACKET_LEN, %r13
+    jne     .probe_reject
+
+    # --- Step 2: Temporal dimension ------------------------------------------
+    # TODO: compute epoch = ts_ns / EPOCH_NS
+    # TODO: compare to epoch embedded in packet at correct offset
+    # TODO: allow ±1 epoch (clock skew tolerance)
+
+    # --- Step 3: Auth-tag verification ---------------------------------------
+    # TODO: derive key from (epoch, SECRET_K0, SECRET_K1)
+    # TODO: compute auth-tag over packet[0..AUTH_TAG_OFFSET]
+    # TODO: constant-time compare with packet[AUTH_TAG_OFFSET..AUTH_TAG_OFFSET+AUTH_TAG_LEN]
+
+    # --- Accept path ---------------------------------------------------------
+    xor     %eax, %eax      # return 0
+    jmp     .probe_epilogue
+
+.probe_reject:
+    mov     $-1, %eax
+
+.probe_epilogue:
+    # Zero all intermediate registers (defence-in-depth)
+    xor     %rbx, %rbx
+    xor     %r13, %r13
+    xor     %r14, %r14
+    xor     %r15, %r15
+
+    pop     %r15
+    pop     %r14
+    pop     %r13
+    pop     %r12
+    pop     %rbx
+    ret
+.size gp_probe, .-gp_probe
+
+# ── gp_seal ──────────────────────────────────────────────────────────────────
+gp_seal:
+    # Prologue
+    push    %rbx
+    push    %r12
+    push    %r13
+
+    mov     %rdi, %r12      # buf
+    mov     %rsi, %r13      # len (already trusted — only call after gp_probe=0)
+    # rdx = out pointer (SovereignResult*)
+
+    # --- Zero the output struct first ----------------------------------------
+    # TODO: memset(rdx, 0, 108)
+
+    # --- Decode action_id from packet ----------------------------------------
+    # TODO: read action byte(s) from packet, write to [rdx+0] (action_id)
+
+    # --- Decode parameters ---------------------------------------------------
+    # TODO: read u32_param, bytes_param, str_len, str_param from packet
+    #       write to offsets 4, 8, 40, 44 of *rdx
+
+    xor     %eax, %eax      # return 0 (success)
+
+.seal_epilogue:
+    # Zero all scratch registers
+    xor     %rbx, %rbx
+    xor     %r12, %r12
+    xor     %r13, %r13
+
+    pop     %r13
+    pop     %r12
+    pop     %rbx
+    ret
+.size gp_seal, .-gp_seal

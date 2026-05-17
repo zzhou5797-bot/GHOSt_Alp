@@ -8,3 +8,17 @@ target_*
 *.log
 build*.log
 build*.txt
+
+# Sovereign layer — closed source, never in VCS
+server/sovereign/gp_sovereign.s
+server/sovereign/libgp_sovereign.a
+server/sovereign/gp_sovereign.o
+
+# Client hash-chain state — contains live sequence numbers and anchor hashes.
+# Committing this would allow replay attacks.
+.ghost_chain_state
+
+# TLS private keys — test certs in certs/ are acceptable, but never commit real keys
+*.key
+# Exception: the example test keys in certs/ are intentionally tracked for local dev
+!certs/*.key

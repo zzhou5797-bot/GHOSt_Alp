@@ -902,6 +902,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -1199,6 +1200,13 @@ dependencies = [
 [[package]]
 name = "ghost-chain-tests"
 version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.5",
+ "serde_json",
+ "shared",
+]
 
 [[package]]
 name = "h2"
@@ -3198,6 +3206,7 @@ dependencies = [
  "aya",
  "bincode",
  "bytes",
+ "cc",
  "clap",
  "ed25519-dalek",
  "futures",
@@ -4349,6 +4358,20 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "libp2p",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "shared",
+ "tokio",
+]
 
 [[package]]
 name = "yamux"

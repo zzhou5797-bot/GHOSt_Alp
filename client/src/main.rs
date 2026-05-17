@@ -20,7 +20,7 @@ struct Cli {
 enum Commands {
     /// Connect to a remote Ghost Grid gateway node
     Connect(ConnectArgs),
-    /// (Phase 4.4) Connect to local daemon to stream TUI metrics
+    /// Connect to local daemon to stream TUI metrics (not yet implemented)
     Ui,
 }
 
@@ -53,10 +53,6 @@ struct ConnectArgs {
     /// Path to client private key
     #[arg(long, default_value = "../certs/client.key")]
     key: PathBuf,
-
-    /// Allow insecure TLS connections (skip verification)
-    #[arg(long, default_value_t = false)]
-    insecure_skip_tls_verify: bool,
 
     // ── V2 Hash-Chain Configuration (Auto-managed if not specified) ──
     #[arg(
@@ -159,45 +155,66 @@ fn derive_anchor(seed: [u8; 8], depth: u64, k0: u64, k1: u64) -> [u8; 8] {
 }
 
 /// State persisted to disk between runs.
-/// Format (binary, little-endian): [seed: 8 bytes][current_seq: 8 bytes]
-const STATE_MAGIC: &[u8; 4] = b"GCv2";
+///
+/// GCv3 format (little-endian): `magic(4) + seed(8) + current_seq(8) + current_hash(8)` = 28 bytes.
+/// GCv2 format (legacy):        `magic(4) + seed(8) + current_seq(8)` = 20 bytes.
+///
+/// GCv3 stores `current_hash` alongside `current_seq`, making each call O(1) instead of O(seq).
+/// When a GCv2 file is detected, the hash is recomputed once and the file is upgraded to GCv3.
+const STATE_MAGIC_V2: &[u8; 4] = b"GCv2";
+const STATE_MAGIC_V3: &[u8; 4] = b"GCv3";
 
 fn load_or_init_state(
     state_file: &PathBuf,
     seed: [u8; 8],
     chain_depth: u64,
-) -> Result<(u64, [u8; 8])> {
-    // Try to read existing state
+    k0: u64,
+    k1: u64,
+) -> Result<(u64, [u8; 8], [u8; 8])> {
     if let Ok(data) = fs::read(state_file) {
-        if data.len() == 20 && &data[0..4] == STATE_MAGIC {
+        // --- GCv3: magic(4) + seed(8) + seq(8) + hash(8) = 28 bytes ---
+        if data.len() == 28 && &data[0..4] == STATE_MAGIC_V3 {
             let stored_seed: [u8; 8] = data[4..12].try_into().unwrap();
             let current_seq = u64::from_le_bytes(data[12..20].try_into().unwrap());
-
+            let current_hash: [u8; 8] = data[20..28].try_into().unwrap();
             if stored_seed == seed && current_seq > 0 {
-                return Ok((current_seq, stored_seed));
+                return Ok((current_seq, stored_seed, current_hash));
+            }
+        }
+        // --- GCv2 (legacy): upgrade to GCv3 by recomputing hash once ---
+        if data.len() == 20 && &data[0..4] == STATE_MAGIC_V2 {
+            let stored_seed: [u8; 8] = data[4..12].try_into().unwrap();
+            let current_seq = u64::from_le_bytes(data[12..20].try_into().unwrap());
+            if stored_seed == seed && current_seq > 0 {
+                eprintln!("Ghost Chain: upgrading state file from GCv2 to GCv3\r");
+                let current_hash = get_hash_at_seq(stored_seed, current_seq, k0, k1);
+                save_state(state_file, seed, current_seq, current_hash)?;
+                return Ok((current_seq, stored_seed, current_hash));
             }
         }
     }
 
-    // Fresh state: start at top of chain (seq = chain_depth)
+    // Fresh state: start at top of chain.
     eprintln!(
         "Ghost Chain: initialising new chain (depth={})\r",
         chain_depth
     );
-    save_state(state_file, seed, chain_depth)?;
-    Ok((chain_depth, seed))
+    let initial_hash = get_hash_at_seq(seed, chain_depth, k0, k1);
+    save_state(state_file, seed, chain_depth, initial_hash)?;
+    Ok((chain_depth, seed, initial_hash))
 }
 
-fn save_state(state_file: &PathBuf, seed: [u8; 8], current_seq: u64) -> Result<()> {
-    let mut data = Vec::with_capacity(20);
-    data.extend_from_slice(STATE_MAGIC);
+fn save_state(state_file: &PathBuf, seed: [u8; 8], current_seq: u64, current_hash: [u8; 8]) -> Result<()> {
+    let mut data = Vec::with_capacity(28);
+    data.extend_from_slice(STATE_MAGIC_V3);
     data.extend_from_slice(&seed);
     data.extend_from_slice(&current_seq.to_le_bytes());
+    data.extend_from_slice(&current_hash);
     fs::write(state_file, &data)
         .with_context(|| format!("Failed to write chain state to {:?}", state_file))
 }
 
-/// Retrieve H_{current_seq} by walking forward from seed.
+/// Retrieve H_{seq} by walking forward from seed.
 /// seq=0 → seed itself; seq=N → anchor H_N.
 fn get_hash_at_seq(seed: [u8; 8], seq: u64, k0: u64, k1: u64) -> [u8; 8] {
     let mut h = seed;
@@ -216,7 +233,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Connect(args) => run_connect(args).await,
         Commands::Ui => {
-            println!("(Phase 4.4) UI attach mode requested. Not yet implemented.");
+            eprintln!("TUI monitor is not yet implemented.");
             Ok(())
         }
     }
@@ -241,14 +258,8 @@ async fn run_connect(args: ConnectArgs) -> Result<()> {
 
 async fn setup_quic_client(args: &ConnectArgs, pb: &ProgressBar) -> Result<ClientConfig> {
     // 1. Load CA cert
-    if !args.ca.exists() {
-        pb.set_message(
-            "Warning: CA cert not found, continuing with insecure bypass if flag set...",
-        );
-    }
     let ca_cert_pem =
         fs::read(&args.ca).with_context(|| format!("Failed to read CA cert from {:?}", args.ca))?;
-    let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
 
     // 2. Load Client cert
     let cert_pem = fs::read(&args.cert)
@@ -267,94 +278,24 @@ async fn setup_quic_client(args: &ConnectArgs, pb: &ProgressBar) -> Result<Clien
     let priv_key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
 
-    // 4. Configure TLS
-    if args.insecure_skip_tls_verify {
-        let mut crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_client_auth_cert(vec![cert], priv_key)?;
-        crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-        let mut config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-        ));
-        let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-        config.transport_config(Arc::new(transport));
-        Ok(config)
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        let ca_cert_pem = fs::read(&args.ca)
-            .with_context(|| format!("Failed to read CA cert from {:?}", args.ca))?;
-        let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
-        for cert in rustls_pemfile::certs(&mut ca_cert_reader).collect::<Result<Vec<_>, _>>()? {
-            roots.add(cert)?;
-        }
-
-        let mut crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_client_auth_cert(vec![cert], priv_key)?;
-        crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
-
-        let mut config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-        ));
-        let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
-        config.transport_config(Arc::new(transport));
-        Ok(config)
+    // 4. Build verified mTLS config — insecure bypass is not supported.
+    let mut roots = rustls::RootCertStore::empty();
+    let mut ca_cert_reader = std::io::BufReader::new(ca_cert_pem.as_slice());
+    for cert in rustls_pemfile::certs(&mut ca_cert_reader).collect::<Result<Vec<_>, _>>()? {
+        roots.add(cert)?;
     }
-}
-
-// Insecure TLS verification for local tests
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA1,
-            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
-    }
+    let mut crypto = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(vec![cert], priv_key)?;
+    crypto.alpn_protocols = shared::ALPN_GHOSTPTY.iter().map(|&x| x.into()).collect();
+    let mut config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    config.transport_config(Arc::new(transport));
+    let _ = pb; // progress bar passed for future use
+    Ok(config)
 }
 
 async fn run_client(args: ConnectArgs) -> Result<()> {
@@ -396,15 +337,16 @@ async fn run_client(args: ConnectArgs) -> Result<()> {
     };
     let seed_u64 = u64::from_str_radix(seed_hex, 16).unwrap_or(0x0102030405060708);
     let seed: [u8; 8] = seed_u64.to_le_bytes();
-    let (mut current_seq, chain_seed) =
-        load_or_init_state(&args.state_file, seed, args.chain_depth)?;
+    let (mut current_seq, chain_seed, knock_hash) =
+        load_or_init_state(&args.state_file, seed, args.chain_depth, secret_k0, secret_k1)?;
     if current_seq == 0 {
         anyhow::bail!("Hash chain exhausted (seq=0). Re-register H_N with the gateway.");
     }
-    let knock_hash = get_hash_at_seq(chain_seed, current_seq, secret_k0, secret_k1);
     let subject_id = args.target; // P2P Gateway registered ID
+    // Advance the chain: the next hash is one step before the current position.
+    let next_hash = get_hash_at_seq(chain_seed, current_seq - 1, secret_k0, secret_k1);
     let next_seq = current_seq - 1;
-    save_state(&args.state_file, chain_seed, next_seq)?;
+    save_state(&args.state_file, chain_seed, next_seq, next_hash)?;
     current_seq = next_seq;
     pb.set_message(format!("Ghost Chain: seq={} remaining", current_seq));
 
@@ -430,15 +372,32 @@ async fn run_client(args: ConnectArgs) -> Result<()> {
         .await
         .context("Failed to send v2 SPA knock")?;
 
-    // Allow XDP map insertion to propagate (~50 ms)
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    // ── Attempt QUIC connect (v2 path only) ──────────────────────────────────
+    // ── Attempt QUIC connect with exponential backoff ────────────────────────
+    // XDP processes the SPA knock synchronously in the NIC driver; the ALLOW_LIST_MAP
+    // entry is written before send_to() returns. A brief retry loop handles rare
+    // CPU-scheduling edge cases where the kernel BPF map write is not yet visible.
     pb.set_message(format!("Establishing QUIC tunnel to {}...", remote_addr));
-    let connection = endpoint
-        .connect(remote_addr, "localhost")?
-        .await
-        .context("QUIC connect failed after v2 knock")?;
+    let connection = {
+        let mut delay_ms = 2u64;
+        let mut last_err = None;
+        let mut result = None;
+        for attempt in 0..6u32 {
+            match endpoint.connect(remote_addr, "localhost")?.await {
+                Ok(c) => { result = Some(c); break; }
+                Err(e) => {
+                    if attempt < 5 {
+                        eprintln!("QUIC connect attempt {} failed, retrying in {}ms: {}", attempt + 1, delay_ms, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        delay_ms = (delay_ms * 2).min(100);
+                        last_err = Some(e);
+                    } else {
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        result.ok_or_else(|| anyhow::anyhow!("QUIC connect failed after 6 attempts: {:?}", last_err))?
+    };
     pb.finish_with_message("✓ Connected (v2 Hash Chain)!");
 
     // 1. Open Control Stream FIRST

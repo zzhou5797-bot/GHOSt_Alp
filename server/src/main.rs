@@ -4,17 +4,18 @@ mod genesis;
 mod p2p;
 mod protocol;
 mod session;
+mod sovereign;
 
 use anyhow::{Context, Result};
 use aya::{
-    maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap},
+    maps::{Array, AsyncPerfEventArray, HashMap as EbpfHashMap, RingBuf},
     programs::{TracePoint, Xdp, XdpFlags},
     Ebpf, EbpfLoader,
 };
 use bytes::BytesMut;
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use gateway_ebpf_common::{AuditEvent, AuthState};
+use gateway_ebpf_common::{AuditEvent, AuthState, SovereignItem};
 use quinn::{Endpoint, ServerConfig};
 use std::{
     fs,
@@ -41,7 +42,7 @@ struct Args {
     #[arg(long, default_value = "../certs/server.key")]
     key: PathBuf,
 
-    #[arg(long, env = "GATEWAY_TOKEN", default_value = "secret-token")]
+    #[arg(long, env = "GATEWAY_TOKEN")]
     token: String,
 
     #[arg(long, default_value = "lo")]
@@ -52,6 +53,13 @@ struct Args {
     /// When omitted, only mDNS local-network discovery is used.
     #[arg(long, value_delimiter = ',')]
     bootstrap_peers: Vec<String>,
+
+    /// Comma-separated Ed25519 public keys (hex) authorised to issue GenesisCredentials.
+    /// Also seeds the initial slash-voter set.
+    /// When omitted, the built-in **development test keys** are used — never omit in production.
+    /// Alternatively set via GENESIS_KEYS_HEX (colon-separated).
+    #[arg(long, env = "GENESIS_KEYS_HEX", value_delimiter = ',')]
+    genesis_keys: Vec<String>,
 }
 
 #[tokio::main]
@@ -88,13 +96,11 @@ async fn main() -> Result<()> {
     let bpf_path = std::env::var("GHOSTPTY_BPF_PATH")
         .unwrap_or_else(|_| "target/bpfel-unknown-none/release/gateway-ebpf".to_string());
 
-    // ── Map Pinning: persist all BPF maps across server restarts ────────────────────
+    // ── Map Pinning: persist all BPF maps across server restarts ──────────────
     // EbpfLoader::map_pin_path() pins every map under /sys/fs/bpf/ghostpty/.
-    // On first launch: maps are created, pinned, and loaded into the kernel.
-    // On restart:      the pre-existing pinned maps are reused unchanged,
-    //                  preserving AUTH_STATE_MAP hash-chain state, token
-    //                  buckets, quotas, and ALLOW_LIST_MAP IP bindings.
-    // Reference: https://docs.rs/aya/latest/aya/struct.EbpfLoader.html
+    // On first launch the maps are created and pinned; on restart the existing
+    // pinned maps are reused, preserving AUTH_STATE_MAP hash-chain state, token
+    // buckets, quotas, and ALLOW_LIST_MAP IP bindings.
     let bpf_fs = std::path::PathBuf::from("/sys/fs/bpf/ghostpty");
     std::fs::create_dir_all(&bpf_fs).context("Failed to create /sys/fs/bpf/ghostpty")?;
 
@@ -110,10 +116,9 @@ async fn main() -> Result<()> {
         .context("Failed to attach XDP program")?;
     tracing::info!("XDP Program attached to interface: {}", args.iface);
 
-    // ── v1 compat: restore TIME_DELTA_MAP (UNIX_ns − ktime_ns offset) ──────────────────
-    // Required for the dual-stack XDP path (handle_v1_knock uses this to convert
-    // ktime to unix time for the 60 s recency window). Has zero cost when no v1
-    // clients connect; the map slot is simply unused.
+    // ── v1 compat: write TIME_DELTA_MAP (UNIX_ns − ktime_ns offset) ─────────────
+    // Required by the XDP v1 knock handler to convert kernel monotonic time to
+    // wall time for the 60-second recency window check.
     {
         let uptime_str = fs::read_to_string("/proc/uptime").context("read /proc/uptime")?;
         let uptime_secs: f64 = uptime_str
@@ -206,6 +211,47 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Build the live Tier-1 validator set from runtime-provided keys.
+    // Governance transactions received over gossipsub will mutate this at runtime.
+    if args.genesis_keys.is_empty() {
+        tracing::warn!("No --genesis-keys provided — using built-in DEV test keys. Do NOT use in production.");
+    }
+    let validator_set = Arc::new(tokio::sync::RwLock::new(
+        genesis::ValidatorSet::bootstrap(&args.genesis_keys),
+    ));
+    tracing::info!("ValidatorSet initialized ({} genesis keys).", args.genesis_keys.len().max(2));
+
+    // Sovereign ring-buffer task.
+    // Reads raw packets forwarded by the XDP sovereign filter (not in this repo).
+    // When the ring buffer is empty (no filter installed), this task is a no-op.
+    {
+        let sv_rb = RingBuf::try_from(
+            unsafe { &mut *bpf_ptr }
+                .take_map("SOVEREIGN_RB")
+                .ok_or_else(|| anyhow::anyhow!("SOVEREIGN_RB not found"))?,
+        )?;
+        let sv_vs = Arc::clone(&validator_set);
+        tokio::spawn(async move {
+            let mut sv_rb = sv_rb;
+            loop {
+                while let Some(item) = sv_rb.next() {
+                    if item.len() < std::mem::size_of::<SovereignItem>() {
+                        continue;
+                    }
+                    let sv: SovereignItem = unsafe {
+                        std::ptr::read_unaligned(item.as_ptr() as *const SovereignItem)
+                    };
+                    // Clamp sv.len to the actual data array length to prevent over-reads.
+                    let data_len = (sv.len as usize).min(sv.data.len());
+                    let data = &sv.data[..data_len];
+                    let mut vs = sv_vs.write().await;
+                    sovereign::apply(data, &mut *vs);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        });
+    }
+
     // Extract AUDIT_CGROUP_MAP before perf_array borrows bpf, so we can move it to the
     // cgroup registration task independently.
     let audit_cgroup_map: EbpfHashMap<_, u64, u8> = EbpfHashMap::try_from(
@@ -222,16 +268,14 @@ async fn main() -> Result<()> {
     )?;
     let cpus = aya::util::online_cpus().unwrap_or_else(|_| vec![0]);
 
-    // ── Phase 6.2 Genesis Replay Tracking (Removed in Phase 7.3) ──────────
-    // used_nonces cache has been eradicated to prevent OOM vulnerabilities.
-    // Maps `cgroup_id` to its originating `client_subject` so that `audit_execve`
-    // anomalies can be traced back to the DID for P2P Slasher consensus.
+    // cgroup_to_subject: maps cgroup_id to its originating client_subject so that
+    // audit_execve anomalies can be traced back to the DID for P2P slash consensus.
     let cgroup_to_subject: Arc<tokio::sync::Mutex<std::collections::HashMap<u64, u32>>> =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let audit_cgroup_tracker = Arc::clone(&cgroup_to_subject);
     let manager_cgroup_tracker = Arc::clone(&cgroup_to_subject);
 
-    // ── Phase 3.1: Gossipsub P2P Swarm ──────────────────────────────────────────
+    // ── P2P gossipsub swarm ───────────────────────────────────────────────────
     let bootstrap_multiaddrs: Vec<libp2p::Multiaddr> = args
         .bootstrap_peers
         .iter()
@@ -251,8 +295,9 @@ async fn main() -> Result<()> {
             Arc::clone(&auth_state_map),
             p2p_rx,
             bootstrap_multiaddrs,
+            Arc::clone(&validator_set),
         ));
-        tracing::info!("Phase 3.1: Hybrid Gossipsub Control Plane initialized.");
+        tracing::info!("Gossipsub control plane initialized.");
     } else {
         tracing::error!("Failed to initialize P2P swarm. Gossipsub disabled.");
     }
@@ -298,7 +343,9 @@ async fn main() -> Result<()> {
                             args
                         );
 
-                        // ── 0-Day Anomaly Detection Heuristics ─────────────────
+                        // ── Anomaly detection: binary execution allowlist ────────────────
+                        // Any execution outside the allowlist triggers an immediate
+                        // P2P slash vote broadcast against the originating DID.
                         let allowed_binaries = [
                             "/bin/bash",
                             "/bin/bash",
@@ -317,13 +364,13 @@ async fn main() -> Result<()> {
                         let is_anomaly = !allowed_binaries.iter().any(|&x| x == filename);
 
                         if is_anomaly {
-                            tracing::error!("🚨 0-DAY HEURISTIC TRIPPED: Execution outside Whitelist detected! ({})", filename);
+                            tracing::error!("Execution outside allowlist detected: {}", filename);
                             // Trace cgroup back to DID
                             let tracker = cpu_tracker.lock().await;
                             if let Some(&subject) = tracker.get(&event.cgroup_id) {
                                 drop(tracker); // Drop lock before async send
                                 tracing::error!(
-                                    "🛡️ Broadcasting P2P Slash Consensus vote against DID: {}",
+                                    "Broadcasting P2P slash vote against DID: {}",
                                     subject
                                 );
 
@@ -342,7 +389,10 @@ async fn main() -> Result<()> {
                                     let mut priv_bytes = [0u8; 32];
                                     if hex::decode_to_slice(&dev_priv_hex, &mut priv_bytes).is_ok() {
                                         let signing_key = SigningKey::from_bytes(&priv_bytes);
-                                        let msg = format!("slash:{}:{}", subject, target_sequence);
+                                        // Message format: "slash:{subject}:{issuer_did}:{target_seq}"
+                                        // Must match verify_slash_signature in genesis.rs.
+                                        let issuer_did: u32 = 0; // Dev node DID
+                                        let msg = format!("slash:{}:{}:{}", subject, issuer_did, target_sequence);
                                         let signature = signing_key.sign(msg.as_bytes());
                                         let signature_hex = hex::encode(signature.to_bytes());
 
@@ -350,10 +400,10 @@ async fn main() -> Result<()> {
                                             .send(p2p::P2pMessage::Slash {
                                                 subject,
                                                 reason: format!(
-                                                    "0-Day Heuristic: Remote Payload execution ({})",
+                                                    "Unauthorized exec: {}",
                                                     filename
                                                 ),
-                                                issuer_did: 0, // Dev Node represents ID 0
+                                                issuer_did,
                                                 signature_hex,
                                                 target_sequence,
                                             })
@@ -368,11 +418,8 @@ async fn main() -> Result<()> {
                                 tracing::warn!("0-Day triggered but no matching subject found for cgroup_id {}", event.cgroup_id);
                             }
                         } else {
-                            // Phase 6.3: Vanity Display Logic / Legacy Hooks
-                            // Provide an isolated observation hook for "vanity" operations that
-                            // don't trigger protocol slashes but look cool on the Dashboard.
                             tracing::debug!(
-                                "VANITY_HOOK: Legitimate execution recognized: {} {}",
+                                "Allowed execution: {} {}",
                                 filename,
                                 args
                             );
@@ -424,8 +471,10 @@ async fn main() -> Result<()> {
     // Channel for session IP registration / deregistration
     let (allowlist_tx, mut allowlist_rx) = tokio::sync::mpsc::channel::<(u32, u32, bool)>(64);
 
-    // allowlist_rx task: manages ALLOW_LIST_MAP updates from QUIC sessions.
-    // Each message is (ip, subject, add=true|false).
+    // ── allowlist_rx task: manages ALLOW_LIST_MAP updates from QUIC sessions ──
+    // Each message is (ip, subject, add=true|remove=false).
+    // A ref-count is maintained so shared IPs (e.g. NAT) are only evicted when
+    // the last session using that IP closes.
     let allowlist_allow_map = Arc::clone(&allow_list_map);
     tokio::spawn(async move {
         let mut ip_ref_counts: std::collections::HashMap<u32, (u32, usize)> =
@@ -586,6 +635,7 @@ async fn main() -> Result<()> {
         let allowlist_tx_clone = allowlist_tx.clone();
         let auth_map_clone = Arc::clone(&auth_state_map);
         let p2p_tx_clone = p2p_tx.clone();
+        let validator_set_clone = Arc::clone(&validator_set);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -684,6 +734,7 @@ async fn main() -> Result<()> {
                 synced_bytes,
                 quota_seq,
                 p2p_tx_clone,
+                validator_set_clone,
             )
             .await
             {
@@ -735,7 +786,7 @@ fn configure_server(
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
         .with_single_cert(cert_chain, priv_key)?;
-    server_crypto.alpn_protocols = shared::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    server_crypto.alpn_protocols = shared::ALPN_GHOSTPTY.iter().map(|&x| x.into()).collect();
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -765,7 +816,16 @@ async fn handle_connection(
     synced_bytes: Arc<AtomicU64>,
     quota_seq: Arc<AtomicU64>,
     p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
+    validator_set: Arc<tokio::sync::RwLock<genesis::ValidatorSet>>,
 ) -> Result<()> {
+    // Reject connections while network is under emergency pause.
+    {
+        let vs = validator_set.read().await;
+        if vs.paused {
+            anyhow::bail!("Network paused by emergency governance.");
+        }
+    }
+
     // 1. Accept Control Stream FIRST (Uni-directional)
     let control_rx = connection.accept_uni().await?;
     tracing::info!("Control Stream established");
@@ -786,8 +846,12 @@ async fn handle_connection(
             Ok(state) => state.quota_bytes,
             Err(_) => {
                 if let Some(vc) = &handshake.genesis_vc {
-                    // Phase 7.3: Timeless Anchor Hash Validation
-                    if genesis::verify_genesis_credential(vc) && vc.subject == client_subject {
+                    // Use the live ValidatorSet instead of static bootstrap constants.
+                    let vc_ok = {
+                        let vs = validator_set.read().await;
+                        vs.verify_genesis_credential(vc)
+                    };
+                    if vc_ok && vc.subject == client_subject {
                         tracing::info!(
                             "Genesis Bootstrap: New client verified. Allocating {} bytes.",
                             vc.request_quota

@@ -1,3 +1,17 @@
+//! libp2p gossipsub control plane.
+//!
+//! Two topics are maintained:
+//!
+//! * `ghost_grid_quota` — propagates per-DID quota consumption deltas across nodes so
+//!   every peer converges on the same remaining-bytes view without shared state.
+//!
+//! * `ghost_grid_slash` — carries Ed25519-signed revocation proposals.  When a node's
+//!   anomaly detector fires it broadcasts a `P2pMessage::Slash`; once `bft_threshold`
+//!   distinct votes for the same (subject, sequence) pair are received, the subject's
+//!   `revoked` flag is set in the local `AUTH_STATE_MAP`.
+//!
+//! Discovery uses mDNS for LAN peers and optional bootstrap multiaddrs for WAN mesh.
+
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
@@ -7,37 +21,49 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use std::collections::{HashMap, HashSet};
 
+/// Quota consumption delta broadcast to peers after each `SYNC_THRESHOLD` flush.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct QuotaUpdate {
     pub client_subject: u32,
+    /// Bytes consumed since the last sync broadcast.
     pub delta_consumed: u64,
+    /// Monotonically increasing sequence number; peers ignore stale updates.
     pub sequence_number: u64,
 }
 
+/// Messages sent over the gossipsub control plane.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum P2pMessage {
     Quota(QuotaUpdate),
     Slash {
+        /// DID of the subject being proposed for revocation.
         subject: u32,
+        /// Human-readable description of the anomaly that triggered the slash.
         reason: String,
+        /// DID of the node issuing this vote.
         issuer_did: u32,
+        /// Ed25519 signature over `"slash:{subject}:{issuer_did}"`.
         signature_hex: String,
+        /// Quota sequence number at the time of the slash event (used to detect stale votes).
         target_sequence: u64,
     },
 }
 
+/// Combined libp2p `NetworkBehaviour` for GhostPTY nodes.
 #[derive(NetworkBehaviour)]
 pub struct GhostP2PBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
 }
 
+/// Build a gossipsub + mDNS swarm with a fresh ephemeral identity.
 pub fn build_swarm() -> Result<Swarm<GhostP2PBehaviour>> {
     let mut swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -77,15 +103,20 @@ pub fn build_swarm() -> Result<Swarm<GhostP2PBehaviour>> {
     Ok(swarm)
 }
 
+/// Run the P2P gossipsub event loop.
+///
+/// Subscribes to the quota and slash topics, dials bootstrap peers, and
+/// processes incoming messages.  Runs until the tokio runtime shuts down.
 pub async fn run_p2p(
     mut swarm: Swarm<GhostP2PBehaviour>,
-    auth_state_map: std::sync::Arc<
+    auth_state_map: Arc<
         tokio::sync::Mutex<
             aya::maps::HashMap<aya::maps::MapData, u32, gateway_ebpf_common::AuthState>,
         >,
     >,
     mut local_updates_rx: mpsc::Receiver<P2pMessage>,
     bootstrap_peers: Vec<Multiaddr>,
+    validator_set: Arc<tokio::sync::RwLock<crate::genesis::ValidatorSet>>,
 ) {
     let topic = gossipsub::IdentTopic::new("ghost_grid_quota");
     let slash_topic = gossipsub::IdentTopic::new("ghost_grid_slash");
@@ -127,13 +158,18 @@ pub async fn run_p2p(
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(GhostP2PBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: peer_id,
-                    message_id: _id,
                     message,
+                    ..
                 })) => {
                     if let Ok(p2p_msg) = bincode::deserialize::<P2pMessage>(&message.data) {
                         match p2p_msg {
                             P2pMessage::Quota(update) => {
+                                // Reject unreasonably large deltas from potentially malicious peers.
+                                const MAX_QUOTA_DELTA: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+                                if update.delta_consumed > MAX_QUOTA_DELTA {
+                                    warn!("Dropping quota update from DID {}: delta {} exceeds limit", update.client_subject, update.delta_consumed);
+                                    continue;
+                                }
                                 info!("Received Gossip Quota Update for DID {}: {} bytes", update.client_subject, update.delta_consumed);
                                 let mut map = auth_state_map.lock().await;
                                 if let Ok(mut state) = map.get(&update.client_subject, 0) {
@@ -147,26 +183,30 @@ pub async fn run_p2p(
                             P2pMessage::Slash { subject, reason, issuer_did, signature_hex, target_sequence } => {
                                 info!("Received Slash Proposal from DID {} for DID {}: {} (Seq {})", issuer_did, subject, reason, target_sequence);
 
-                                // Phase 6.2: Sybil Threshold Cryptographic Check
-                                if !crate::genesis::verify_slash_signature(subject, issuer_did, &signature_hex) {
-                                    warn!("🚨 Dropped invalid BFT Slash signature from DID {}", issuer_did);
+                                let (sig_ok, threshold) = {
+                                    let vs = validator_set.read().await;
+                                    (
+                                        vs.verify_slash_signature(subject, issuer_did, target_sequence, &signature_hex),
+                                        vs.bft_threshold,
+                                    )
+                                };
+                                if !sig_ok {
+                                    warn!("Dropped invalid BFT Slash signature from DID {}", issuer_did);
                                     continue;
                                 }
 
                                 let votes = slash_votes.entry((subject, target_sequence)).or_default();
                                 votes.insert(issuer_did);
 
-                                // BFT Slash Consensus: Require at least 3 unique Authorized DIDs to prevent Sybil attacks
-                                if votes.len() >= 3 {
-                                    info!("BFT Threshold (3) reached! Slashing DID {} permanently at seq {}.", subject, target_sequence);
+                                if votes.len() >= threshold {
+                                    info!("BFT Threshold ({}) reached! Slashing DID {} at seq {}.", threshold, subject, target_sequence);
                                     let mut map = auth_state_map.lock().await;
                                     if let Ok(mut state) = map.get(&subject, 0) {
-                                        // Auto-expire legacy misvotes by only honoring the slash if the state's seq matches or is closely tracking the vote
                                         if state.last_seen_quota_seq <= target_sequence || state.last_seen_quota_seq == 0 {
                                             state.revoked = 1;
                                             let _ = map.insert(subject, state, 0);
                                         } else {
-                                            info!("BFT Threshold reached but ignored: Target seq {} is older than actual seq {}.", target_sequence, state.last_seen_quota_seq);
+                                            info!("BFT Threshold reached but ignored: target seq {} older than actual seq {}.", target_sequence, state.last_seen_quota_seq);
                                         }
                                     }
                                 }
