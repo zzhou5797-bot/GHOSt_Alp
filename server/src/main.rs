@@ -85,7 +85,8 @@ async fn main() -> Result<()> {
     tracing::info!("QUIC Server listening on {}", endpoint.local_addr()?);
 
     // XDP Loader Routine
-    let bpf_path = "target/bpfel-unknown-none/release/gateway-ebpf";
+    let bpf_path = std::env::var("GHOSTPTY_BPF_PATH")
+        .unwrap_or_else(|_| "target/bpfel-unknown-none/release/gateway-ebpf".to_string());
 
     // ── Map Pinning: persist all BPF maps across server restarts ────────────────────
     // EbpfLoader::map_pin_path() pins every map under /sys/fs/bpf/ghostpty/.
