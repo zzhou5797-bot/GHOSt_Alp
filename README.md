@@ -1,7 +1,5 @@
 # GhostPTY
 
-> **Open-source release** — [github.com/zzhou5797-bot/GHOSt_Alp](https://github.com/zzhou5797-bot/GHOSt_Alp) · Apache-2.0 · Alpha
-
 **A communication protocol and remote terminal that does not require TCP/IP infrastructure — no routable IP address, no CA, no DNS, no coordination server.**
 
 `nmap` shows nothing. Shodan finds nothing. The server is running. This is not a firewall rule. This is cryptography at the NIC layer, before IP.
