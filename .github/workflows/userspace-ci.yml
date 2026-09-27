@@ -1,0 +1,21 @@
+name: userspace-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  userspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile userspace targets
+        run: |
+          cargo check -p client -p server -p ghost-mcp -p ghost-mcp-agent -p ghost-mcp-tools
+          cargo check -p xtask --bin xtask
+      - name: Unit and protocol tests
+        run: cargo test -p shared -p ghost-chain-tests -p ghost-mcp-tools
+      - name: Ghost MCP non-root smoke
+        run: bash tests/mcp_smoke.sh
