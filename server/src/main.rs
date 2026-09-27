@@ -60,6 +60,18 @@ struct Args {
     /// Alternatively set via GENESIS_KEYS_HEX (colon-separated).
     #[arg(long, env = "GENESIS_KEYS_HEX", value_delimiter = ',')]
     genesis_keys: Vec<String>,
+
+    /// Filesystem root exposed to Ghost MCP tools.
+    #[arg(long, env = "GHOST_MCP_ROOT", default_value = ".")]
+    mcp_root: PathBuf,
+
+    /// Allow Ghost MCP run_command requests. Disabled by default.
+    #[arg(long, env = "GHOST_MCP_ENABLE_COMMAND", default_value_t = false)]
+    mcp_enable_command: bool,
+
+    /// Maximum UTF-8 payload returned or written by a Ghost MCP file/command tool.
+    #[arg(long, env = "GHOST_MCP_MAX_FILE_BYTES", default_value_t = ghost_mcp_tools::DEFAULT_MAX_FILE_BYTES)]
+    mcp_max_file_bytes: usize,
 }
 
 #[tokio::main]
@@ -73,6 +85,12 @@ async fn main() -> Result<()> {
             }
         }
         let mut cmd = std::process::Command::new("sh");
+        if let Ok(cwd) = std::env::var("INTERNAL_GHOST_MCP_CWD") {
+            cmd.current_dir(cwd);
+        }
+        if let Ok(command) = std::env::var("INTERNAL_GHOST_MCP_COMMAND") {
+            cmd.arg("-lc").arg(command);
+        }
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
         eprintln!("Failed to exec shell: {}", err);
         std::process::exit(1);
@@ -84,6 +102,21 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let addr = format!("0.0.0.0:{}", args.port).parse::<SocketAddr>()?;
+
+    let mcp_policy = Arc::new(
+        ghost_mcp_tools::ToolPolicy::new(
+            &args.mcp_root,
+            args.mcp_enable_command,
+            args.mcp_max_file_bytes,
+        )
+        .await?,
+    );
+    tracing::info!(
+        root = %mcp_policy.root.display(),
+        command_enabled = mcp_policy.enable_command,
+        max_file_bytes = mcp_policy.max_file_bytes,
+        "Ghost MCP gateway tools configured"
+    );
 
     let token = Arc::new(args.token);
 
@@ -187,27 +220,36 @@ async fn main() -> Result<()> {
 
     // AUTH_STATE_MAP is managed exclusively by the GC daemon (opened after bpf leak below).
 
-    // Startup seed: ensure subject=1 has a valid quota entry (idempotent).
-    // Required when the pinned BPF map entry was evicted by GC (quota exhausted)
-    // and the client does not carry a genesis VC.
+    // Development bootstrap for subject=1. XDP stores H_N as the anchor and
+    // requires the first proof to be H_{N-1} with seq=N-1.
+    // Never revive an existing zero-quota/revoked entry here.
     {
         let mut auth_map = auth_state_map.lock().await;
-        let needs_seed = match auth_map.get(&1u32, 0) {
-            Ok(state) => state.quota_bytes == 0,
-            Err(_) => true,
-        };
-        if needs_seed {
-            let state = AuthState {
-                expected_seq: 10000,
-                anchor_hash_lo: 0,
-                bucket_tokens: AuthState::MAX_TOKENS,
-                last_refill_ns: 0,
-                quota_bytes: 10_000_000_000, // 10 GiB
-                last_seen_quota_seq: 0,
-                revoked: 0,
-            };
-            let _ = auth_map.insert(1u32, state, 0);
-            tracing::info!("AUTH_STATE_MAP: seeded default quota for subject=1 (10 GiB)");
+        let dev_anchor = u64::from_le_bytes(shared::spa::dev_anchor());
+        match auth_map.get(&1u32, 0) {
+            Err(_) => {
+                let state = AuthState {
+                    expected_seq: shared::spa::DEV_CHAIN_DEPTH,
+                    anchor_hash_lo: dev_anchor,
+                    bucket_tokens: AuthState::MAX_TOKENS,
+                    last_refill_ns: 0,
+                    quota_bytes: 10_000_000_000, // 10 GiB
+                    last_seen_quota_seq: 0,
+                    revoked: 0,
+                };
+                let _ = auth_map.insert(1u32, state, 0);
+                tracing::info!("AUTH_STATE_MAP: seeded dev DID=1 with a 10 GiB quota");
+            }
+            Ok(mut state)
+                if state.revoked == 0
+                    && state.anchor_hash_lo == 0
+                    && state.expected_seq == shared::spa::DEV_CHAIN_DEPTH =>
+            {
+                state.anchor_hash_lo = dev_anchor;
+                let _ = auth_map.insert(1u32, state, 0);
+                tracing::warn!("AUTH_STATE_MAP: migrated legacy zero anchor for dev DID=1");
+            }
+            Ok(_) => {}
         }
     }
 
@@ -350,16 +392,21 @@ async fn main() -> Result<()> {
                         // P2P slash vote broadcast against the originating DID.
                         let allowed_binaries = [
                             "/bin/bash",
-                            "/bin/bash",
+                            "/usr/bin/bash",
                             "/bin/sh",
+                            "/usr/bin/sh",
                             "/bin/ls",
+                            "/usr/bin/ls",
                             "/bin/cat",
+                            "/usr/bin/cat",
                             "/usr/bin/clear",
                             "/usr/bin/env",
                             "/usr/bin/tmux",
                             "/bin/grep",
+                            "/usr/bin/grep",
                             "/usr/bin/awk",
                             "/bin/sed",
+                            "/usr/bin/sed",
                             "/usr/bin/id",
                             "/usr/bin/whoami",
                         ];
@@ -638,6 +685,7 @@ async fn main() -> Result<()> {
         let auth_map_clone = Arc::clone(&auth_state_map);
         let p2p_tx_clone = p2p_tx.clone();
         let validator_set_clone = Arc::clone(&validator_set);
+        let mcp_policy_clone = Arc::clone(&mcp_policy);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -720,26 +768,57 @@ async fn main() -> Result<()> {
                 return;
             }
 
+            let negotiated_alpn = connection
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|data| data.protocol);
+
             let consumed_bytes = Arc::new(AtomicU64::new(0));
             let synced_bytes = Arc::new(AtomicU64::new(0));
             let quota_seq = Arc::new(AtomicU64::new(1));
 
-            if let Err(e) = handle_connection(
-                connection,
-                &token_clone,
-                cgroup_tx_clone,
-                allowlist_tx_clone,
-                auth_map_clone,
-                client_ip,
-                client_subject,
-                consumed_bytes,
-                synced_bytes,
-                quota_seq,
-                p2p_tx_clone,
-                validator_set_clone,
-            )
-            .await
-            {
+            let result = match negotiated_alpn.as_deref() {
+                Some(b"ghostmcp/1") => {
+                    tracing::info!("Dispatching DID {} to Ghost MCP structured tool plane", client_subject);
+                    handle_mcp_connection(
+                        connection,
+                        &token_clone,
+                        cgroup_tx_clone,
+                        allowlist_tx_clone,
+                        auth_map_clone,
+                        client_ip,
+                        client_subject,
+                        quota_seq,
+                        p2p_tx_clone,
+                        validator_set_clone,
+                        mcp_policy_clone,
+                    )
+                    .await
+                }
+                Some(b"ghostpty/1") => {
+                    handle_connection(
+                        connection,
+                        &token_clone,
+                        cgroup_tx_clone,
+                        allowlist_tx_clone,
+                        auth_map_clone,
+                        client_ip,
+                        client_subject,
+                        consumed_bytes,
+                        synced_bytes,
+                        quota_seq,
+                        p2p_tx_clone,
+                        validator_set_clone,
+                    )
+                    .await
+                }
+                other => Err(anyhow::anyhow!(
+                    "Unsupported or missing negotiated ALPN: {:?}",
+                    other.map(|value| String::from_utf8_lossy(value).into_owned())
+                )),
+            };
+
+            if let Err(e) = result {
                 tracing::error!("Connection error with {}: {:?}", remote, e);
             }
         });
@@ -788,7 +867,11 @@ fn configure_server(
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_auth)
         .with_single_cert(cert_chain, priv_key)?;
-    server_crypto.alpn_protocols = shared::ALPN_GHOSTPTY.iter().map(|&x| x.into()).collect();
+    server_crypto.alpn_protocols = shared::ALPN_GHOSTPTY
+        .iter()
+        .chain(shared::ALPN_GHOST_MCP.iter())
+        .map(|&x| x.into())
+        .collect();
 
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
@@ -804,6 +887,394 @@ fn configure_server(
     server_config.transport_config(Arc::new(transport_config));
 
     Ok(server_config)
+}
+
+const GHOST_MCP_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+
+async fn handle_mcp_connection(
+    connection: quinn::Connection,
+    expected_token: &str,
+    cgroup_tx: tokio::sync::mpsc::Sender<(u64, u32, bool)>,
+    allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
+    auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
+    client_ip: u32,
+    client_subject: u32,
+    quota_seq: Arc<AtomicU64>,
+    p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
+    validator_set: Arc<tokio::sync::RwLock<genesis::ValidatorSet>>,
+    tool_policy: Arc<ghost_mcp_tools::ToolPolicy>,
+) -> Result<()> {
+    {
+        let vs = validator_set.read().await;
+        if vs.paused {
+            anyhow::bail!("Network paused by emergency governance.");
+        }
+    }
+
+    let (mut tx, mut rx) = match connection.accept_bi().await {
+        Ok(streams) => streams,
+        Err(err) => {
+            clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+            return Err(err.into());
+        }
+    };
+    let (auth, auth_bytes): (shared::mcp_wire::AgentRequest, usize) =
+        match read_mcp_frame(&mut rx).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+                return Err(err);
+            }
+        };
+
+    let supplied_token = match auth {
+        shared::mcp_wire::AgentRequest::Authenticate { token } => token,
+        _ => {
+            write_mcp_frame(
+                &mut tx,
+                &shared::mcp_wire::AgentResponse::error(
+                    "authenticate must be the first Ghost MCP frame",
+                ),
+            )
+            .await?;
+            clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+            tx.finish()?;
+            return Ok(());
+        }
+    };
+
+    if expected_token.len() != supplied_token.len()
+        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected_token.as_bytes(),
+            supplied_token.as_bytes(),
+        ))
+    {
+        write_mcp_frame(
+            &mut tx,
+            &shared::mcp_wire::AgentResponse::error("authentication failed"),
+        )
+        .await?;
+        clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+        tx.finish()?;
+        return Ok(());
+    }
+
+    if let Err(err) = ensure_mcp_subject_active(&auth_state_map, client_subject).await {
+        clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+        return Err(err);
+    }
+    if let Err(err) = consume_mcp_quota(
+        &auth_state_map,
+        client_subject,
+        auth_bytes as u64,
+        &quota_seq,
+        &p2p_tx,
+    )
+    .await
+    {
+        clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
+        return Err(err);
+    }
+
+    allowlist_tx
+        .send((client_ip, client_subject, true))
+        .await
+        .ok();
+
+    static MCP_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mcp_session_id = MCP_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let command_cgroup = if tool_policy.enable_command {
+        match cgroup::SessionCgroup::create_empty(&format!("mcp_session_{mcp_session_id}")) {
+            Ok(cg) => {
+                cgroup_tx.send((cg.id, client_subject, true)).await.ok();
+                tracing::info!(
+                    "[AUDIT] Ghost MCP command cgroup active: DID={} cgroup_id={}",
+                    client_subject,
+                    cg.id
+                );
+                Some(cg)
+            }
+            Err(err) => {
+                tracing::error!(
+                    "[AUDIT] Ghost MCP command execution fail-closed: unable to create cgroup: {:#}",
+                    err
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let auth_response = shared::mcp_wire::AgentResponse::success(serde_json::json!({
+        "authenticated": true,
+        "gateway": true,
+        "did": client_subject,
+        "root": tool_policy.root,
+        "command_enabled": tool_policy.enable_command && command_cgroup.is_some(),
+        "alpn": "ghostmcp/1"
+    }));
+
+    let session_result = async {
+        write_mcp_frame_charged(
+            &mut tx,
+            &auth_response,
+            &auth_state_map,
+            client_subject,
+            &quota_seq,
+            &p2p_tx,
+        )
+        .await?;
+
+        loop {
+            let (request, request_bytes): (shared::mcp_wire::AgentRequest, usize) =
+                match read_mcp_frame(&mut rx).await {
+                    Ok(value) => value,
+                    Err(err) if mcp_clean_eof(&err) => break,
+                    Err(err) => return Err(err),
+                };
+
+            if matches!(request, shared::mcp_wire::AgentRequest::Authenticate { .. }) {
+                let response = shared::mcp_wire::AgentResponse::error("already authenticated");
+                write_mcp_frame_charged(
+                    &mut tx,
+                    &response,
+                    &auth_state_map,
+                    client_subject,
+                    &quota_seq,
+                    &p2p_tx,
+                )
+                .await?;
+                continue;
+            }
+
+            consume_mcp_quota(
+                &auth_state_map,
+                client_subject,
+                request_bytes as u64,
+                &quota_seq,
+                &p2p_tx,
+            )
+            .await?;
+
+            let response = match execute_gateway_mcp_request(
+                request,
+                &tool_policy,
+                command_cgroup
+                    .as_ref()
+                    .map(|cg| cg.path.join("cgroup.procs")),
+            )
+            .await
+            {
+                Ok(value) => shared::mcp_wire::AgentResponse::success(value),
+                Err(err) => shared::mcp_wire::AgentResponse::error(format!("{err:#}")),
+            };
+
+            write_mcp_frame_charged(
+                &mut tx,
+                &response,
+                &auth_state_map,
+                client_subject,
+                &quota_seq,
+                &p2p_tx,
+            )
+            .await?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Some(cg) = command_cgroup {
+        tracing::info!(
+            "[AUDIT] Deactivating Ghost MCP cgroup_id={} for DID={}",
+            cg.id,
+            client_subject
+        );
+        let _ = cgroup_tx.send((cg.id, client_subject, false)).await;
+        drop(cg);
+    }
+
+    let _ = allowlist_tx.send((client_ip, client_subject, false)).await;
+
+    session_result
+}
+
+async fn clear_rejected_mcp_spa_lease(
+    allowlist_tx: &tokio::sync::mpsc::Sender<(u32, u32, bool)>,
+    client_ip: u32,
+    client_subject: u32,
+) {
+    // XDP creates the SPA lease before QUIC/token authentication. Registering
+    // then immediately deregistering through the ref-count manager removes
+    // this rejected lease without disrupting another live session on the same IP.
+    let _ = allowlist_tx.send((client_ip, client_subject, true)).await;
+    let _ = allowlist_tx.send((client_ip, client_subject, false)).await;
+}
+
+async fn execute_gateway_mcp_request(
+    request: shared::mcp_wire::AgentRequest,
+    policy: &ghost_mcp_tools::ToolPolicy,
+    command_cgroup_procs: Option<PathBuf>,
+) -> Result<serde_json::Value> {
+    match request {
+        shared::mcp_wire::AgentRequest::SystemInfo => {
+            let mut value = ghost_mcp_tools::system_info(policy).await?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("gateway".into(), serde_json::Value::Bool(true));
+                object.insert(
+                    "command_enabled".into(),
+                    serde_json::Value::Bool(
+                        policy.enable_command && command_cgroup_procs.is_some(),
+                    ),
+                );
+            }
+            Ok(value)
+        }
+        shared::mcp_wire::AgentRequest::RunCommand {
+            command,
+            cwd,
+            timeout_ms,
+        } if policy.enable_command => {
+            let cgroup_procs = command_cgroup_procs.ok_or_else(|| {
+                anyhow::anyhow!("run_command unavailable: audit cgroup setup failed")
+            })?;
+            ghost_mcp_tools::reject_blocked_command(&command)?;
+            let cwd = ghost_mcp_tools::resolve_cwd(policy, cwd.as_deref()).await?;
+            let timeout_ms = timeout_ms.unwrap_or(30_000).clamp(100, 120_000);
+
+            let mut child = tokio::process::Command::new(std::env::current_exe()?);
+            child
+                .env("INTERNAL_CGROUP_JOIN", &cgroup_procs)
+                .env("INTERNAL_GHOST_MCP_COMMAND", &command)
+                .env("INTERNAL_GHOST_MCP_CWD", &cwd)
+                .current_dir(&cwd)
+                .kill_on_drop(true);
+
+            let output =
+                tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.output())
+                    .await
+                    .context("command timed out")??;
+
+            ghost_mcp_tools::command_result(&command, &cwd, &output, policy.max_file_bytes)
+        }
+        other => ghost_mcp_tools::execute_request(other, policy).await,
+    }
+}
+
+async fn ensure_mcp_subject_active(
+    auth_state_map: &Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
+    client_subject: u32,
+) -> Result<()> {
+    let auth_map = auth_state_map.lock().await;
+    let state = auth_map.get(&client_subject, 0).map_err(|_| {
+        anyhow::anyhow!(
+            "DID {} has no active Ghost authorization state",
+            client_subject
+        )
+    })?;
+    if state.revoked != 0 || state.quota_bytes == 0 {
+        anyhow::bail!("DID {} is revoked or has zero quota", client_subject);
+    }
+    Ok(())
+}
+
+async fn consume_mcp_quota(
+    auth_state_map: &Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
+    client_subject: u32,
+    bytes: u64,
+    quota_seq: &Arc<AtomicU64>,
+    p2p_tx: &tokio::sync::mpsc::Sender<p2p::P2pMessage>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+
+    {
+        let mut auth_map = auth_state_map.lock().await;
+        let mut state = auth_map
+            .get(&client_subject, 0)
+            .map_err(|_| anyhow::anyhow!("Ghost authorization state disappeared"))?;
+
+        if state.revoked != 0 || state.quota_bytes < bytes {
+            state.quota_bytes = 0;
+            state.revoked = 1;
+            let _ = auth_map.insert(client_subject, state, 0);
+            anyhow::bail!("Ghost MCP quota exhausted or DID revoked");
+        }
+
+        state.quota_bytes -= bytes;
+        if state.quota_bytes == 0 {
+            state.revoked = 1;
+        }
+        auth_map.insert(client_subject, state, 0)?;
+    }
+
+    let _ = p2p_tx
+        .send(p2p::P2pMessage::Quota(p2p::QuotaUpdate {
+            client_subject,
+            delta_consumed: bytes,
+            sequence_number: quota_seq.fetch_add(1, Ordering::Relaxed),
+        }))
+        .await;
+    Ok(())
+}
+
+async fn read_mcp_frame<T: serde::de::DeserializeOwned>(
+    rx: &mut quinn::RecvStream,
+) -> Result<(T, usize)> {
+    let mut len_buf = [0u8; 4];
+    rx.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > GHOST_MCP_MAX_FRAME_BYTES {
+        anyhow::bail!("invalid Ghost MCP frame length: {}", len);
+    }
+    let mut body = vec![0u8; len];
+    rx.read_exact(&mut body).await?;
+    Ok((serde_json::from_slice(&body)?, len + 4))
+}
+
+async fn write_mcp_frame<T: serde::Serialize>(
+    tx: &mut quinn::SendStream,
+    value: &T,
+) -> Result<usize> {
+    let body = serde_json::to_vec(value)?;
+    if body.len() > GHOST_MCP_MAX_FRAME_BYTES {
+        anyhow::bail!("Ghost MCP response frame too large: {}", body.len());
+    }
+    tx.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    tx.write_all(&body).await?;
+    Ok(body.len() + 4)
+}
+
+async fn write_mcp_frame_charged<T: serde::Serialize>(
+    tx: &mut quinn::SendStream,
+    value: &T,
+    auth_state_map: &Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
+    client_subject: u32,
+    quota_seq: &Arc<AtomicU64>,
+    p2p_tx: &tokio::sync::mpsc::Sender<p2p::P2pMessage>,
+) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
+    if body.len() > GHOST_MCP_MAX_FRAME_BYTES {
+        anyhow::bail!("Ghost MCP response frame too large: {}", body.len());
+    }
+    consume_mcp_quota(
+        auth_state_map,
+        client_subject,
+        (body.len() + 4) as u64,
+        quota_seq,
+        p2p_tx,
+    )
+    .await?;
+    tx.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    tx.write_all(&body).await?;
+    Ok(())
+}
+
+fn mcp_clean_eof(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("closed") || msg.contains("finished") || msg.contains("early")
 }
 
 async fn handle_connection(
@@ -858,12 +1329,14 @@ async fn handle_connection(
                             "Genesis Bootstrap: New client verified. Allocating {} bytes.",
                             vc.request_quota
                         );
+                        let anchor_hash_lo =
+                            u64::from_le_bytes(vc.anchor_hash[0..8].try_into().unwrap());
                         let state = AuthState {
                             quota_bytes: vc.request_quota,
-                            bucket_tokens: 100,
+                            bucket_tokens: AuthState::MAX_TOKENS,
                             last_refill_ns: 0,
-                            expected_seq: 10000,
-                            anchor_hash_lo: 0,
+                            expected_seq: shared::spa::DEV_CHAIN_DEPTH,
+                            anchor_hash_lo,
                             last_seen_quota_seq: 0,
                             revoked: 0,
                         };

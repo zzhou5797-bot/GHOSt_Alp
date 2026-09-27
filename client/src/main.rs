@@ -58,7 +58,7 @@ struct ConnectArgs {
     #[arg(
         long,
         env = "SPA_KEY",
-        default_value = "deadbeef01020304badc0ffe0a0b0c0d"
+        default_value = "deadbeef01020304badce0ff0a0b0c0d"
     )]
     spa_key: String,
 
@@ -320,24 +320,10 @@ async fn run_client(args: ConnectArgs) -> Result<()> {
     // 0. V2: Generate Single Packet Auth (SPA) Knock
     pb.set_message(format!("SPA Knocking {}:{}...", args.host, args.port));
     // ── V2 SPA: derive key material and hash chain position ─────────────────
-    let secret_k0: u64 = if args.spa_key.len() == 32 {
-        u64::from_str_radix(&args.spa_key[0..16], 16).unwrap_or(0x04030201efbeadde)
-    } else {
-        0x04030201efbeadde
-    };
-    let secret_k1: u64 = if args.spa_key.len() == 32 {
-        u64::from_str_radix(&args.spa_key[16..32], 16).unwrap_or(0x0d0c0b0affe0dcba)
-    } else {
-        0x0d0c0b0affe0dcba
-    };
-    let seed_hex = if args.seed.len() >= 16 {
-        &args.seed[0..16]
-    } else {
-        "0102030405060708"
-    };
-    let seed_u64 = u64::from_str_radix(seed_hex, 16).unwrap_or(0x0102030405060708);
-    let seed: [u8; 8] = seed_u64.to_le_bytes();
-    let (mut current_seq, chain_seed, knock_hash) =
+    let (secret_k0, secret_k1) = shared::spa::parse_key_hex(&args.spa_key)
+        .unwrap_or((shared::spa::DEV_SECRET_K0, shared::spa::DEV_SECRET_K1));
+    let seed = shared::spa::parse_seed_hex(&args.seed).unwrap_or(shared::spa::DEV_SEED);
+    let (mut current_seq, chain_seed, _current_anchor) =
         load_or_init_state(&args.state_file, seed, args.chain_depth, secret_k0, secret_k1)?;
     if current_seq == 0 {
         anyhow::bail!("Hash chain exhausted (seq=0). Re-register H_N with the gateway.");
@@ -360,8 +346,8 @@ async fn run_client(args: ConnectArgs) -> Result<()> {
     v2_payload.extend_from_slice(&(0x5453_5054u32).to_be_bytes()); // magic
     v2_payload.extend_from_slice(&2u32.to_be_bytes()); // version
     v2_payload.extend_from_slice(&subject_id.to_be_bytes());
-    v2_payload.extend_from_slice(&(current_seq + 1).to_be_bytes());
-    v2_payload.extend_from_slice(&knock_hash);
+    v2_payload.extend_from_slice(&current_seq.to_be_bytes());
+    v2_payload.extend_from_slice(&next_hash);
     v2_payload.extend_from_slice(&[0u8; 32]); // signature placeholder
 
     let spa_socket = UdpSocket::bind("0.0.0.0:0")

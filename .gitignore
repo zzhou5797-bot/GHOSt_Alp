@@ -17,6 +17,7 @@ server/sovereign/gp_sovereign.o
 # Client hash-chain state — contains live sequence numbers and anchor hashes.
 # Committing this would allow replay attacks.
 .ghost_chain_state
+.ghost_mcp_chain_state
 
 # Internal development notes — not for public consumption
 task.md

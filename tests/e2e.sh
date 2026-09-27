@@ -35,7 +35,7 @@ SERVER_PID_FILE="/tmp/ghostpty_e2e_server.pid"
 VERBOSE="${VERBOSE:-0}"
 
 # Dev-mode SPA key/seed (matches client defaults)
-SPA_KEY="deadbeef01020304badc0ffe0a0b0c0d"
+SPA_KEY="deadbeef01020304badce0ff0a0b0c0d"
 SPA_SEED="0102030405060708090a0b0c0d0e0f10"
 
 # ── Counters ──────────────────────────────────────────────────────────────────

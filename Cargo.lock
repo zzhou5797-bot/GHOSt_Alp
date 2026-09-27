@@ -1308,6 +1308,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ghost-mcp-tools",
  "quinn",
  "rustls",
  "rustls-pemfile",
@@ -1318,6 +1319,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ghost-mcp-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "shared",
+ "tokio",
 ]
 
 [[package]]
@@ -3460,6 +3471,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "gateway-ebpf-common",
+ "ghost-mcp-tools",
  "hex",
  "libc",
  "libp2p",
