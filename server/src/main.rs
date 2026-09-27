@@ -27,6 +27,9 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
+type CgroupAck = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
+type CgroupUpdate = (u64, u32, bool, Option<CgroupAck>);
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -554,28 +557,46 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, u32, bool)>(64);
+    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<CgroupUpdate>(64);
     tokio::spawn(async move {
         let mut cgroup_map = audit_cgroup_map;
-        while let Some((cgroup_id, subject, add)) = cgroup_rx.recv().await {
-            if add {
-                let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
-                manager_cgroup_tracker
-                    .lock()
-                    .await
-                    .insert(cgroup_id, subject);
-                tracing::info!(
-                    "[AUDIT] Registered cgroup_id={} for DID={} in AUDIT_CGROUP_MAP",
-                    cgroup_id,
-                    subject
-                );
+        while let Some((cgroup_id, subject, add, ack)) = cgroup_rx.recv().await {
+            let result = if add {
+                match cgroup_map.insert(cgroup_id, 1u8, 0) {
+                    Ok(_) => {
+                        manager_cgroup_tracker
+                            .lock()
+                            .await
+                            .insert(cgroup_id, subject);
+                        tracing::info!(
+                            "[AUDIT] Registered cgroup_id={} for DID={} in AUDIT_CGROUP_MAP",
+                            cgroup_id,
+                            subject
+                        );
+                        Ok(())
+                    }
+                    Err(err) => Err(format!(
+                        "failed to register cgroup_id={} in AUDIT_CGROUP_MAP: {}",
+                        cgroup_id, err
+                    )),
+                }
             } else {
-                let _ = cgroup_map.remove(&cgroup_id);
+                let result = cgroup_map
+                    .remove(&cgroup_id)
+                    .map_err(|err| format!(
+                        "failed to remove cgroup_id={} from AUDIT_CGROUP_MAP: {}",
+                        cgroup_id, err
+                    ));
                 manager_cgroup_tracker.lock().await.remove(&cgroup_id);
                 tracing::info!(
                     "[AUDIT] Removed cgroup_id={} from AUDIT_CGROUP_MAP",
                     cgroup_id
                 );
+                result
+            };
+
+            if let Some(ack) = ack {
+                let _ = ack.send(result);
             }
         }
     });
@@ -894,7 +915,7 @@ const GHOST_MCP_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 async fn handle_mcp_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<(u64, u32, bool)>,
+    cgroup_tx: tokio::sync::mpsc::Sender<CgroupUpdate>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
@@ -986,13 +1007,27 @@ async fn handle_mcp_connection(
     let command_cgroup = if tool_policy.enable_command {
         match cgroup::SessionCgroup::create_empty(&format!("mcp_session_{mcp_session_id}")) {
             Ok(cg) => {
-                cgroup_tx.send((cg.id, client_subject, true)).await.ok();
-                tracing::info!(
-                    "[AUDIT] Ghost MCP command cgroup active: DID={} cgroup_id={}",
-                    client_subject,
-                    cg.id
-                );
-                Some(cg)
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let registered = cgroup_tx
+                    .send((cg.id, client_subject, true, Some(ack_tx)))
+                    .await
+                    .is_ok()
+                    && matches!(ack_rx.await, Ok(Ok(())));
+
+                if registered {
+                    tracing::info!(
+                        "[AUDIT] Ghost MCP command cgroup active: DID={} cgroup_id={}",
+                        client_subject,
+                        cg.id
+                    );
+                    Some(cg)
+                } else {
+                    tracing::error!(
+                        "[AUDIT] Ghost MCP command execution fail-closed: cgroup_id={} was not confirmed in AUDIT_CGROUP_MAP",
+                        cg.id
+                    );
+                    None
+                }
             }
             Err(err) => {
                 tracing::error!(
@@ -1091,7 +1126,7 @@ async fn handle_mcp_connection(
             cg.id,
             client_subject
         );
-        let _ = cgroup_tx.send((cg.id, client_subject, false)).await;
+        let _ = cgroup_tx.send((cg.id, client_subject, false, None)).await;
         drop(cg);
     }
 
@@ -1280,7 +1315,7 @@ fn mcp_clean_eof(err: &anyhow::Error) -> bool {
 async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<(u64, u32, bool)>,
+    cgroup_tx: tokio::sync::mpsc::Sender<CgroupUpdate>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
@@ -1388,7 +1423,7 @@ async fn handle_connection(
     let _session_cgroup = match cgroup::SessionCgroup::create_empty(&session_id) {
         Ok(cg) => {
             // Send cgroup_id to the main task to insert into AUDIT_CGROUP_MAP
-            cgroup_tx.send((cg.id, client_subject, true)).await.ok();
+            cgroup_tx.send((cg.id, client_subject, true, None)).await.ok();
             tracing::info!("[AUDIT] Activated kernel probe for cgroup_id={}", cg.id);
             Some(cg)
         }
@@ -1683,7 +1718,7 @@ async fn handle_connection(
 
     if let Some(cg) = _session_cgroup {
         tracing::info!("[AUDIT] Deactivating kernel probe for cgroup_id={}", cg.id);
-        let _ = cgroup_tx.send((cg.id, client_subject, false)).await;
+        let _ = cgroup_tx.send((cg.id, client_subject, false, None)).await;
     }
 
     // Remove the IP binding when the session ends
