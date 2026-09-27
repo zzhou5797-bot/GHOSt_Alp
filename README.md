@@ -336,3 +336,18 @@ See [LICENSE](LICENSE).
 
 
 <img width="859" height="407" alt="image" src="https://github.com/user-attachments/assets/adae57f1-f28d-49ac-bd72-054513220d8b" />
+
+---
+
+## Ghost MCP bridge (experimental)
+
+This repository includes an experimental Desktop Commander-style MCP path:
+`ghost-mcp` exposes MCP tools over stdio and carries each request over a
+mutually-authenticated Ghost QUIC channel to `ghost-mcp-agent`.
+
+It is testable without root while the existing GhostPTY XDP/eBPF gateway remains
+unchanged. File operations are root-scoped, and command execution is disabled by
+default.
+
+See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for architecture, security notes,
+setup, and the end-to-end smoke test.

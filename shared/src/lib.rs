@@ -1,9 +1,13 @@
 //! Wire types shared between the GhostPTY server and client.
 
 pub mod gp_frame;
+pub mod mcp_wire;
 
 /// QUIC ALPN token identifying the GhostPTY protocol version 1.
 pub const ALPN_GHOSTPTY: &[&[u8]] = &[b"ghostpty/1"];
+
+/// QUIC ALPN token for the structured Ghost MCP transport.
+pub const ALPN_GHOST_MCP: &[&[u8]] = &[b"ghostmcp/1"];
 
 use serde::{Deserialize, Serialize};
 
