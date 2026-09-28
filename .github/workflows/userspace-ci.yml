@@ -11,6 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Compile userspace targets
         run: |
           cargo check -p client -p server -p ghost-mcp -p ghost-mcp-agent -p ghost-mcp-tools
@@ -19,3 +22,7 @@ jobs:
         run: cargo test -p shared -p ghost-chain-tests -p ghost-mcp-tools
       - name: Ghost MCP non-root smoke
         run: bash tests/mcp_smoke.sh
+      - name: Check standalone plugin
+        run: |
+          npm install --prefix ghost-plugin --no-audit --no-fund
+          node --check ghost-plugin/server.mjs
