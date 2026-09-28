@@ -339,17 +339,15 @@ See [LICENSE](LICENSE).
 
 ---
 
-## Ghost MCP bridge (experimental)
+## Ghost MCP shell (experimental)
 
-This repository includes a Desktop Commander-style MCP path. `ghost-mcp` exposes
-tools over stdio and supports both a non-root standalone `ghost-mcp-agent` mode
-and the full Ghost gateway path.
+`ghost-mcp` deliberately exposes one MCP tool: `shell`. A caller sends a command
+and Ghost returns stdout, stderr, and the exit code. File operations, searches,
+process inspection, and similar work are done with normal shell commands rather
+than separate MCP tools.
 
-Full gateway mode sends SPA v2 before each QUIC tool connection, negotiates
-`ghostmcp/1`, validates the numeric DID from mTLS, charges AUTH_STATE_MAP quota,
-and keeps command execution inside the existing cgroup/eBPF audit path. File
-operations are confined to the configured MCP root and command execution is
-disabled by default.
+Full gateway mode sends SPA v2 before QUIC, negotiates `ghostmcp/1`, validates
+the numeric DID from mTLS, applies Ghost quota/revocation, and executes the shell
+with the operating-system privileges of the Ghost gateway process.
 
-See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for architecture, security notes,
-setup, `bash tests/mcp_smoke.sh`, and the root-only `make test-mcp-gateway`.
+See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for setup and tests.

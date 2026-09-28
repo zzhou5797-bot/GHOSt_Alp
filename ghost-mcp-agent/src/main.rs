@@ -1,33 +1,20 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use ghost_mcp_tools::{execute_request, ToolPolicy, DEFAULT_MAX_FILE_BYTES};
 use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
 use shared::mcp_wire::{AgentRequest, AgentResponse};
-use std::{
-    net::SocketAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tracing_subscriber::EnvFilter;
 
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Parser, Debug, Clone)]
-#[command(
-    name = "ghost-mcp-agent",
-    version,
-    about = "Desktop-control agent carried over Ghost QUIC/mTLS"
-)]
+#[command(name = "ghost-mcp-agent", version, about = "Minimal Ghost shell agent")]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:9080")]
     listen: SocketAddr,
-
-    #[arg(long, default_value = ".")]
-    root: PathBuf,
 
     #[arg(long, default_value = "certs/ca.crt")]
     ca: PathBuf,
@@ -41,17 +28,14 @@ struct Args {
     #[arg(long, env = "GHOST_MCP_TOKEN")]
     token: String,
 
-    #[arg(long, default_value_t = false)]
-    enable_command: bool,
-
-    #[arg(long, default_value_t = DEFAULT_MAX_FILE_BYTES)]
-    max_file_bytes: usize,
+    #[arg(long, default_value_t = ghost_mcp_tools::DEFAULT_MAX_OUTPUT_BYTES)]
+    max_output_bytes: usize,
 }
 
 #[derive(Clone)]
 struct AgentConfig {
     token: Arc<String>,
-    policy: Arc<ToolPolicy>,
+    max_output_bytes: usize,
 }
 
 #[tokio::main]
@@ -62,28 +46,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let policy = Arc::new(
-        ToolPolicy::new(
-            &args.root,
-            args.enable_command,
-            args.max_file_bytes.min(MAX_FRAME_BYTES),
-        )
-        .await?,
-    );
-
-    let server_config = configure_server(&args.ca, &args.cert, &args.key)?;
-    let endpoint = Endpoint::server(server_config, args.listen)?;
+    let endpoint = Endpoint::server(configure_server(&args.ca, &args.cert, &args.key)?, args.listen)?;
     let cfg = AgentConfig {
         token: Arc::new(args.token),
-        policy,
+        max_output_bytes: args.max_output_bytes.max(1).min(MAX_FRAME_BYTES),
     };
 
-    tracing::info!(
-        listen = %endpoint.local_addr()?,
-        root = %cfg.policy.root.display(),
-        command_enabled = cfg.policy.enable_command,
-        "Ghost MCP agent ready"
-    );
+    tracing::info!(listen = %endpoint.local_addr()?, "Ghost shell agent ready");
 
     while let Some(incoming) = endpoint.accept().await {
         let cfg = cfg.clone();
@@ -92,7 +61,7 @@ async fn main() -> Result<()> {
             match incoming.await {
                 Ok(connection) => {
                     if let Err(err) = handle_connection(connection, cfg).await {
-                        tracing::warn!(%remote, error = %err, "Ghost MCP connection closed");
+                        tracing::warn!(%remote, error = %err, "Ghost shell connection closed");
                     }
                 }
                 Err(err) => tracing::warn!(%remote, error = %err, "QUIC handshake failed"),
@@ -146,52 +115,46 @@ fn configure_server(ca_path: &Path, cert_path: &Path, key_path: &Path) -> Result
 async fn handle_connection(connection: quinn::Connection, cfg: AgentConfig) -> Result<()> {
     let (mut tx, mut rx) = connection.accept_bi().await?;
 
-    let auth: AgentRequest = read_frame(&mut rx).await?;
-    match auth {
-        AgentRequest::Authenticate { token } if token_matches(cfg.token.as_str(), &token) => {
-            write_frame(
-                &mut tx,
-                &AgentResponse::success(json!({
-                    "authenticated": true,
-                    "root": cfg.policy.root,
-                    "command_enabled": cfg.policy.enable_command
-                })),
-            )
-            .await?;
+    match read_frame::<AgentRequest>(&mut rx).await? {
+        AgentRequest::Authenticate { token } if token_matches(&cfg.token, &token) => {
+            write_frame(&mut tx, &AgentResponse::success(json!({"authenticated": true, "shell": true}))).await?;
         }
         AgentRequest::Authenticate { .. } => {
             write_frame(&mut tx, &AgentResponse::error("authentication failed")).await?;
             tx.finish()?;
-            tokio::time::sleep(Duration::from_millis(20)).await;
             return Ok(());
         }
         _ => {
-            write_frame(
-                &mut tx,
-                &AgentResponse::error("authenticate must be the first frame"),
-            )
-            .await?;
+            write_frame(&mut tx, &AgentResponse::error("authenticate must be the first frame")).await?;
             tx.finish()?;
-            tokio::time::sleep(Duration::from_millis(20)).await;
             return Ok(());
         }
     }
 
     loop {
-        let request: AgentRequest = match read_frame(&mut rx).await {
+        let request = match read_frame::<AgentRequest>(&mut rx).await {
             Ok(value) => value,
-            Err(err) if is_clean_eof(&err) => break,
+            Err(err) if clean_eof(&err) => break,
             Err(err) => return Err(err),
         };
-        if matches!(request, AgentRequest::Authenticate { .. }) {
-            write_frame(&mut tx, &AgentResponse::error("already authenticated")).await?;
-            continue;
-        }
 
-        let response = match execute_request(request, &cfg.policy).await {
-            Ok(value) => AgentResponse::success(value),
-            Err(err) => AgentResponse::error(format!("{err:#}")),
+        let response = match request {
+            AgentRequest::Shell { command, cwd, timeout_ms } => {
+                match ghost_mcp_tools::shell(
+                    &command,
+                    cwd.as_deref(),
+                    timeout_ms,
+                    cfg.max_output_bytes,
+                )
+                .await
+                {
+                    Ok(value) => AgentResponse::success(value),
+                    Err(err) => AgentResponse::error(format!("{err:#}")),
+                }
+            }
+            AgentRequest::Authenticate { .. } => AgentResponse::error("already authenticated"),
         };
+
         write_frame(&mut tx, &response).await?;
     }
 
@@ -199,10 +162,11 @@ async fn handle_connection(connection: quinn::Connection, cfg: AgentConfig) -> R
 }
 
 fn token_matches(expected: &str, supplied: &str) -> bool {
-    expected.len() == supplied.len() && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+    expected.len() == supplied.len()
+        && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
 }
 
-fn is_clean_eof(err: &anyhow::Error) -> bool {
+fn clean_eof(err: &anyhow::Error) -> bool {
     let msg = err.to_string().to_ascii_lowercase();
     msg.contains("closed") || msg.contains("finished") || msg.contains("early")
 }

@@ -85,85 +85,22 @@ struct GhostMcp {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct PathParams {
-    /// Path relative to the agent root, or an absolute path inside that root.
-    path: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ReadFileParams {
-    /// Path relative to the agent root, or an absolute path inside that root.
-    path: String,
-    /// Zero-based line offset.
-    offset: Option<usize>,
-    /// Maximum number of lines to return.
-    length: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct WriteFileParams {
-    /// Path relative to the agent root, or an absolute path inside that root.
-    path: String,
-    /// Complete UTF-8 file contents.
-    content: String,
-    /// Create missing parent directories.
-    #[serde(default)]
-    create_parents: bool,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RunCommandParams {
-    /// Shell command to execute on the Ghost-controlled host.
+struct ShellParams {
+    /// Shell command executed with /bin/sh -lc on the Ghost host.
     command: String,
-    /// Working directory inside the agent root. Defaults to the root.
+    /// Optional working directory. Defaults to the Ghost process working directory.
     cwd: Option<String>,
-    /// Timeout in milliseconds (100..120000).
+    /// Timeout in milliseconds. Defaults to 30000, max 300000.
     timeout_ms: Option<u64>,
 }
 
 #[tool_router(server_handler)]
 impl GhostMcp {
     #[tool(
-        description = "Return basic information about the Ghost-controlled host and agent policy."
+        description = "Execute a shell command on the Ghost-controlled host and return stdout, stderr, and exit code."
     )]
-    async fn system_info(&self) -> CallToolResult {
-        self.call_agent(AgentRequest::SystemInfo).await
-    }
-
-    #[tool(description = "List files and directories inside the configured Ghost agent root.")]
-    async fn list_directory(&self, Parameters(params): Parameters<PathParams>) -> CallToolResult {
-        self.call_agent(AgentRequest::ListDirectory { path: params.path })
-            .await
-    }
-
-    #[tool(description = "Read a UTF-8 text file inside the configured Ghost agent root.")]
-    async fn read_file(&self, Parameters(params): Parameters<ReadFileParams>) -> CallToolResult {
-        self.call_agent(AgentRequest::ReadFile {
-            path: params.path,
-            offset: params.offset,
-            length: params.length,
-        })
-        .await
-    }
-
-    #[tool(description = "Replace a UTF-8 text file inside the configured Ghost agent root.")]
-    async fn write_file(&self, Parameters(params): Parameters<WriteFileParams>) -> CallToolResult {
-        self.call_agent(AgentRequest::WriteFile {
-            path: params.path,
-            content: params.content,
-            create_parents: params.create_parents,
-        })
-        .await
-    }
-
-    #[tool(
-        description = "Run a shell command on the Ghost-controlled host. The agent must be started with --enable-command."
-    )]
-    async fn run_command(
-        &self,
-        Parameters(params): Parameters<RunCommandParams>,
-    ) -> CallToolResult {
-        self.call_agent(AgentRequest::RunCommand {
+    async fn shell(&self, Parameters(params): Parameters<ShellParams>) -> CallToolResult {
+        self.call_agent(AgentRequest::Shell {
             command: params.command,
             cwd: params.cwd,
             timeout_ms: params.timeout_ms,

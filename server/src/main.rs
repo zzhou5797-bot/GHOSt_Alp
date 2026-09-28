@@ -27,9 +27,6 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::EnvFilter;
 
-type CgroupAck = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
-type CgroupUpdate = (u64, u32, bool, Option<CgroupAck>);
-
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -64,17 +61,14 @@ struct Args {
     #[arg(long, env = "GENESIS_KEYS_HEX", value_delimiter = ',')]
     genesis_keys: Vec<String>,
 
-    /// Filesystem root exposed to Ghost MCP tools.
-    #[arg(long, env = "GHOST_MCP_ROOT", default_value = ".")]
-    mcp_root: PathBuf,
+    /// Maximum stdout/stderr bytes returned by one MCP shell call.
+    #[arg(
+        long,
+        env = "GHOST_MCP_MAX_OUTPUT_BYTES",
+        default_value_t = ghost_mcp_tools::DEFAULT_MAX_OUTPUT_BYTES
+    )]
+    mcp_max_output_bytes: usize,
 
-    /// Allow Ghost MCP run_command requests. Disabled by default.
-    #[arg(long, env = "GHOST_MCP_ENABLE_COMMAND", default_value_t = false)]
-    mcp_enable_command: bool,
-
-    /// Maximum UTF-8 payload returned or written by a Ghost MCP file/command tool.
-    #[arg(long, env = "GHOST_MCP_MAX_FILE_BYTES", default_value_t = ghost_mcp_tools::DEFAULT_MAX_FILE_BYTES)]
-    mcp_max_file_bytes: usize,
 }
 
 #[tokio::main]
@@ -88,12 +82,6 @@ async fn main() -> Result<()> {
             }
         }
         let mut cmd = std::process::Command::new("sh");
-        if let Ok(cwd) = std::env::var("INTERNAL_GHOST_MCP_CWD") {
-            cmd.current_dir(cwd);
-        }
-        if let Ok(command) = std::env::var("INTERNAL_GHOST_MCP_COMMAND") {
-            cmd.arg("-lc").arg(command);
-        }
         let err = std::os::unix::process::CommandExt::exec(&mut cmd);
         eprintln!("Failed to exec shell: {}", err);
         std::process::exit(1);
@@ -106,20 +94,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let addr = format!("0.0.0.0:{}", args.port).parse::<SocketAddr>()?;
 
-    let mcp_policy = Arc::new(
-        ghost_mcp_tools::ToolPolicy::new(
-            &args.mcp_root,
-            args.mcp_enable_command,
-            args.mcp_max_file_bytes,
-        )
-        .await?,
-    );
-    tracing::info!(
-        root = %mcp_policy.root.display(),
-        command_enabled = mcp_policy.enable_command,
-        max_file_bytes = mcp_policy.max_file_bytes,
-        "Ghost MCP gateway tools configured"
-    );
+    let mcp_max_output_bytes = args
+        .mcp_max_output_bytes
+        .max(1)
+        .min(GHOST_MCP_MAX_FRAME_BYTES);
+
 
     let token = Arc::new(args.token);
 
@@ -557,46 +536,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<CgroupUpdate>(64);
+    let (cgroup_tx, mut cgroup_rx) = tokio::sync::mpsc::channel::<(u64, u32, bool)>(64);
     tokio::spawn(async move {
         let mut cgroup_map = audit_cgroup_map;
-        while let Some((cgroup_id, subject, add, ack)) = cgroup_rx.recv().await {
-            let result = if add {
-                match cgroup_map.insert(cgroup_id, 1u8, 0) {
-                    Ok(_) => {
-                        manager_cgroup_tracker
-                            .lock()
-                            .await
-                            .insert(cgroup_id, subject);
-                        tracing::info!(
-                            "[AUDIT] Registered cgroup_id={} for DID={} in AUDIT_CGROUP_MAP",
-                            cgroup_id,
-                            subject
-                        );
-                        Ok(())
-                    }
-                    Err(err) => Err(format!(
-                        "failed to register cgroup_id={} in AUDIT_CGROUP_MAP: {}",
-                        cgroup_id, err
-                    )),
-                }
+        while let Some((cgroup_id, subject, add)) = cgroup_rx.recv().await {
+            if add {
+                let _ = cgroup_map.insert(cgroup_id, 1u8, 0);
+                manager_cgroup_tracker
+                    .lock()
+                    .await
+                    .insert(cgroup_id, subject);
+                tracing::info!(
+                    "[AUDIT] Registered cgroup_id={} for DID={} in AUDIT_CGROUP_MAP",
+                    cgroup_id,
+                    subject
+                );
             } else {
-                let result = cgroup_map
-                    .remove(&cgroup_id)
-                    .map_err(|err| format!(
-                        "failed to remove cgroup_id={} from AUDIT_CGROUP_MAP: {}",
-                        cgroup_id, err
-                    ));
+                let _ = cgroup_map.remove(&cgroup_id);
                 manager_cgroup_tracker.lock().await.remove(&cgroup_id);
                 tracing::info!(
                     "[AUDIT] Removed cgroup_id={} from AUDIT_CGROUP_MAP",
                     cgroup_id
                 );
-                result
-            };
-
-            if let Some(ack) = ack {
-                let _ = ack.send(result);
             }
         }
     });
@@ -706,7 +667,6 @@ async fn main() -> Result<()> {
         let auth_map_clone = Arc::clone(&auth_state_map);
         let p2p_tx_clone = p2p_tx.clone();
         let validator_set_clone = Arc::clone(&validator_set);
-        let mcp_policy_clone = Arc::clone(&mcp_policy);
         tokio::spawn(async move {
             let remote = conn.remote_address();
             let client_ip = match remote {
@@ -804,7 +764,6 @@ async fn main() -> Result<()> {
                     handle_mcp_connection(
                         connection,
                         &token_clone,
-                        cgroup_tx_clone,
                         allowlist_tx_clone,
                         auth_map_clone,
                         client_ip,
@@ -812,7 +771,7 @@ async fn main() -> Result<()> {
                         quota_seq,
                         p2p_tx_clone,
                         validator_set_clone,
-                        mcp_policy_clone,
+                        mcp_max_output_bytes,
                     )
                     .await
                 }
@@ -915,7 +874,6 @@ const GHOST_MCP_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 async fn handle_mcp_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<CgroupUpdate>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
@@ -923,7 +881,7 @@ async fn handle_mcp_connection(
     quota_seq: Arc<AtomicU64>,
     p2p_tx: tokio::sync::mpsc::Sender<p2p::P2pMessage>,
     validator_set: Arc<tokio::sync::RwLock<genesis::ValidatorSet>>,
-    tool_policy: Arc<ghost_mcp_tools::ToolPolicy>,
+    max_output_bytes: usize,
 ) -> Result<()> {
     {
         let vs = validator_set.read().await;
@@ -939,6 +897,7 @@ async fn handle_mcp_connection(
             return Err(err.into());
         }
     };
+
     let (auth, auth_bytes): (shared::mcp_wire::AgentRequest, usize) =
         match read_mcp_frame(&mut rx).await {
             Ok(frame) => frame,
@@ -953,9 +912,7 @@ async fn handle_mcp_connection(
         _ => {
             write_mcp_frame(
                 &mut tx,
-                &shared::mcp_wire::AgentResponse::error(
-                    "authenticate must be the first Ghost MCP frame",
-                ),
+                &shared::mcp_wire::AgentResponse::error("authenticate must be the first frame"),
             )
             .await?;
             clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
@@ -984,69 +941,26 @@ async fn handle_mcp_connection(
         clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
         return Err(err);
     }
-    if let Err(err) = consume_mcp_quota(
+
+    consume_mcp_quota(
         &auth_state_map,
         client_subject,
         auth_bytes as u64,
         &quota_seq,
         &p2p_tx,
     )
-    .await
-    {
-        clear_rejected_mcp_spa_lease(&allowlist_tx, client_ip, client_subject).await;
-        return Err(err);
-    }
+    .await?;
 
     allowlist_tx
         .send((client_ip, client_subject, true))
         .await
         .ok();
 
-    static MCP_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let mcp_session_id = MCP_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let command_cgroup = if tool_policy.enable_command {
-        match cgroup::SessionCgroup::create_empty(&format!("mcp_session_{mcp_session_id}")) {
-            Ok(cg) => {
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                let registered = cgroup_tx
-                    .send((cg.id, client_subject, true, Some(ack_tx)))
-                    .await
-                    .is_ok()
-                    && matches!(ack_rx.await, Ok(Ok(())));
-
-                if registered {
-                    tracing::info!(
-                        "[AUDIT] Ghost MCP command cgroup active: DID={} cgroup_id={}",
-                        client_subject,
-                        cg.id
-                    );
-                    Some(cg)
-                } else {
-                    tracing::error!(
-                        "[AUDIT] Ghost MCP command execution fail-closed: cgroup_id={} was not confirmed in AUDIT_CGROUP_MAP",
-                        cg.id
-                    );
-                    None
-                }
-            }
-            Err(err) => {
-                tracing::error!(
-                    "[AUDIT] Ghost MCP command execution fail-closed: unable to create cgroup: {:#}",
-                    err
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let auth_response = shared::mcp_wire::AgentResponse::success(serde_json::json!({
         "authenticated": true,
         "gateway": true,
         "did": client_subject,
-        "root": tool_policy.root,
-        "command_enabled": tool_policy.enable_command && command_cgroup.is_some(),
+        "shell": true,
         "alpn": "ghostmcp/1"
     }));
 
@@ -1069,20 +983,6 @@ async fn handle_mcp_connection(
                     Err(err) => return Err(err),
                 };
 
-            if matches!(request, shared::mcp_wire::AgentRequest::Authenticate { .. }) {
-                let response = shared::mcp_wire::AgentResponse::error("already authenticated");
-                write_mcp_frame_charged(
-                    &mut tx,
-                    &response,
-                    &auth_state_map,
-                    client_subject,
-                    &quota_seq,
-                    &p2p_tx,
-                )
-                .await?;
-                continue;
-            }
-
             consume_mcp_quota(
                 &auth_state_map,
                 client_subject,
@@ -1092,17 +992,25 @@ async fn handle_mcp_connection(
             )
             .await?;
 
-            let response = match execute_gateway_mcp_request(
-                request,
-                &tool_policy,
-                command_cgroup
-                    .as_ref()
-                    .map(|cg| cg.path.join("cgroup.procs")),
-            )
-            .await
-            {
-                Ok(value) => shared::mcp_wire::AgentResponse::success(value),
-                Err(err) => shared::mcp_wire::AgentResponse::error(format!("{err:#}")),
+            let response = match request {
+                shared::mcp_wire::AgentRequest::Shell {
+                    command,
+                    cwd,
+                    timeout_ms,
+                } => match ghost_mcp_tools::shell(
+                    &command,
+                    cwd.as_deref(),
+                    timeout_ms,
+                    max_output_bytes,
+                )
+                .await
+                {
+                    Ok(value) => shared::mcp_wire::AgentResponse::success(value),
+                    Err(err) => shared::mcp_wire::AgentResponse::error(format!("{err:#}")),
+                },
+                shared::mcp_wire::AgentRequest::Authenticate { .. } => {
+                    shared::mcp_wire::AgentResponse::error("already authenticated")
+                }
             };
 
             write_mcp_frame_charged(
@@ -1120,18 +1028,7 @@ async fn handle_mcp_connection(
     }
     .await;
 
-    if let Some(cg) = command_cgroup {
-        tracing::info!(
-            "[AUDIT] Deactivating Ghost MCP cgroup_id={} for DID={}",
-            cg.id,
-            client_subject
-        );
-        let _ = cgroup_tx.send((cg.id, client_subject, false, None)).await;
-        drop(cg);
-    }
-
     let _ = allowlist_tx.send((client_ip, client_subject, false)).await;
-
     session_result
 }
 
@@ -1140,61 +1037,8 @@ async fn clear_rejected_mcp_spa_lease(
     client_ip: u32,
     client_subject: u32,
 ) {
-    // XDP creates the SPA lease before QUIC/token authentication. Registering
-    // then immediately deregistering through the ref-count manager removes
-    // this rejected lease without disrupting another live session on the same IP.
     let _ = allowlist_tx.send((client_ip, client_subject, true)).await;
     let _ = allowlist_tx.send((client_ip, client_subject, false)).await;
-}
-
-async fn execute_gateway_mcp_request(
-    request: shared::mcp_wire::AgentRequest,
-    policy: &ghost_mcp_tools::ToolPolicy,
-    command_cgroup_procs: Option<PathBuf>,
-) -> Result<serde_json::Value> {
-    match request {
-        shared::mcp_wire::AgentRequest::SystemInfo => {
-            let mut value = ghost_mcp_tools::system_info(policy).await?;
-            if let Some(object) = value.as_object_mut() {
-                object.insert("gateway".into(), serde_json::Value::Bool(true));
-                object.insert(
-                    "command_enabled".into(),
-                    serde_json::Value::Bool(
-                        policy.enable_command && command_cgroup_procs.is_some(),
-                    ),
-                );
-            }
-            Ok(value)
-        }
-        shared::mcp_wire::AgentRequest::RunCommand {
-            command,
-            cwd,
-            timeout_ms,
-        } if policy.enable_command => {
-            let cgroup_procs = command_cgroup_procs.ok_or_else(|| {
-                anyhow::anyhow!("run_command unavailable: audit cgroup setup failed")
-            })?;
-            ghost_mcp_tools::reject_blocked_command(&command)?;
-            let cwd = ghost_mcp_tools::resolve_cwd(policy, cwd.as_deref()).await?;
-            let timeout_ms = timeout_ms.unwrap_or(30_000).clamp(100, 120_000);
-
-            let mut child = tokio::process::Command::new(std::env::current_exe()?);
-            child
-                .env("INTERNAL_CGROUP_JOIN", &cgroup_procs)
-                .env("INTERNAL_GHOST_MCP_COMMAND", &command)
-                .env("INTERNAL_GHOST_MCP_CWD", &cwd)
-                .current_dir(&cwd)
-                .kill_on_drop(true);
-
-            let output =
-                tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), child.output())
-                    .await
-                    .context("command timed out")??;
-
-            ghost_mcp_tools::command_result(&command, &cwd, &output, policy.max_file_bytes)
-        }
-        other => ghost_mcp_tools::execute_request(other, policy).await,
-    }
 }
 
 async fn ensure_mcp_subject_active(
@@ -1315,7 +1159,7 @@ fn mcp_clean_eof(err: &anyhow::Error) -> bool {
 async fn handle_connection(
     connection: quinn::Connection,
     expected_token: &str,
-    cgroup_tx: tokio::sync::mpsc::Sender<CgroupUpdate>,
+    cgroup_tx: tokio::sync::mpsc::Sender<(u64, u32, bool)>,
     allowlist_tx: tokio::sync::mpsc::Sender<(u32, u32, bool)>,
     auth_state_map: Arc<tokio::sync::Mutex<EbpfHashMap<aya::maps::MapData, u32, AuthState>>>,
     client_ip: u32,
@@ -1423,7 +1267,7 @@ async fn handle_connection(
     let _session_cgroup = match cgroup::SessionCgroup::create_empty(&session_id) {
         Ok(cg) => {
             // Send cgroup_id to the main task to insert into AUDIT_CGROUP_MAP
-            cgroup_tx.send((cg.id, client_subject, true, None)).await.ok();
+            cgroup_tx.send((cg.id, client_subject, true)).await.ok();
             tracing::info!("[AUDIT] Activated kernel probe for cgroup_id={}", cg.id);
             Some(cg)
         }
@@ -1718,7 +1562,7 @@ async fn handle_connection(
 
     if let Some(cg) = _session_cgroup {
         tracing::info!("[AUDIT] Deactivating kernel probe for cgroup_id={}", cg.id);
-        let _ = cgroup_tx.send((cg.id, client_subject, false, None)).await;
+        let _ = cgroup_tx.send((cg.id, client_subject, false)).await;
     }
 
     // Remove the IP binding when the session ends
