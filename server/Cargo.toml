@@ -19,6 +19,7 @@ rcgen = { version = "0.11", features = ["pem"] }
 portable-pty = "0.8"
 futures = "0.3"
 shared = { path = "../shared" }
+ghost-mcp-tools = { path = "../ghost-mcp-tools" }
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

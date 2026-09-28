@@ -14,12 +14,12 @@ DIST_DIR  := dist
 PKG_NAME  := ghostpty-open-$(VERSION)
 PKG_TGZ   := $(DIST_DIR)/$(PKG_NAME).tar.gz
 
-.PHONY: build build-release build-ebpf test-unit test-e2e package-open clean
+.PHONY: build build-release build-ebpf test-unit test-e2e test-mcp-gateway package-open clean
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 build:
-	cargo build -p server -p client -p shared -p ghost-chain-tests
+	cargo build -p server -p client -p shared -p ghost-chain-tests -p ghost-mcp -p ghost-mcp-agent -p ghost-mcp-tools
 
 build-release:
 	cargo build --release -p server -p client -p shared
@@ -31,7 +31,7 @@ build-ebpf:
 
 test-unit:
 	@echo "=== Unit & integration tests (no root required) ==="
-	cargo test -p shared -p ghost-chain-tests -- --test-output immediate
+	cargo test -p shared -p ghost-chain-tests -p ghost-mcp-tools -- --test-output immediate
 	@echo "=== PASS ==="
 
 test-e2e:
@@ -68,3 +68,7 @@ package-open: build
 clean:
 	cargo clean
 	rm -rf $(DIST_DIR)
+
+test-mcp-gateway:
+	@echo "=== Ghost MCP full gateway e2e (requires root + eBPF) ==="
+	bash tests/mcp_gateway_e2e.sh

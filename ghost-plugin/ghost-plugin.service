@@ -1,0 +1,15 @@
+[Unit]
+Description=Ghost Shell ChatGPT Plugin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/work/GHOSt_Alp
+ExecStart=/bin/bash %h/work/GHOSt_Alp/scripts/run-ghost-plugin-dev.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

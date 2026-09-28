@@ -336,3 +336,22 @@ See [LICENSE](LICENSE).
 
 
 <img width="859" height="407" alt="image" src="https://github.com/user-attachments/assets/adae57f1-f28d-49ac-bd72-054513220d8b" />
+
+---
+
+## Ghost Shell plugin (experimental)
+
+Ghost now has a fully independent ChatGPT plugin path with exactly one MCP tool:
+`shell`.
+
+The remote path is:
+
+`ChatGPT -> HTTPS Streamable MCP -> OAuth 2.1/PKCE -> Ghost QUIC -> shell`
+
+It does not use Desktop Commander at runtime. The standalone plugin server lives
+in `ghost-plugin/`, and `scripts/install-ghost-plugin-service.sh` installs a
+user-level systemd service that keeps the plugin, Ghost agent, and HTTPS ingress
+running.
+
+See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for connection, OAuth, deployment,
+and test details.
