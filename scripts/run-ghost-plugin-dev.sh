@@ -9,13 +9,14 @@ TARGET="$ROOT/target"
 AGENT_ADDR="${GHOST_SHELL_ADDR:-127.0.0.1:19085}"
 PLUGIN_ADDR="${GHOST_PLUGIN_HOST:-127.0.0.1}"
 PLUGIN_PORT="${GHOST_PLUGIN_PORT:-8787}"
-CF_LOG="$TARGET/ghost-plugin-cloudflared.log"
+INGRESS_LOG="$TARGET/ghost-plugin-ingress.log"
 PLUGIN_LOG="$TARGET/ghost-plugin-server.log"
 AGENT_LOG="$TARGET/ghost-plugin-agent.log"
 URL_FILE="$TARGET/ghost-plugin-url"
 
 mkdir -p "$TARGET"
 umask 077
+rm -f "$URL_FILE"
 
 secret_file() {
   local file="$1"
@@ -39,7 +40,7 @@ if [[ ! -d "$PLUGIN_DIR/node_modules/@modelcontextprotocol" ]]; then
 fi
 
 cleanup() {
-  for pid in "${PLUGIN_PID:-}" "${CF_PID:-}" "${AGENT_PID:-}"; do
+  for pid in "${PLUGIN_PID:-}" "${INGRESS_PID:-}" "${AGENT_PID:-}"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
     fi
@@ -60,25 +61,28 @@ for _ in $(seq 1 60); do
   sleep 0.1
 done
 
-: > "$CF_LOG"
-echo "[ghost-plugin] starting HTTPS ingress"
-cloudflared tunnel --no-autoupdate --url "http://$PLUGIN_ADDR:$PLUGIN_PORT"   >"$CF_LOG" 2>&1 &
-CF_PID=$!
-
-PUBLIC_ORIGIN=""
-for _ in $(seq 1 120); do
-  PUBLIC_ORIGIN="$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' "$CF_LOG" | head -1 || true)"
-  if [[ -n "$PUBLIC_ORIGIN" ]]; then break; fi
-  if ! kill -0 "$CF_PID" 2>/dev/null; then
-    cat "$CF_LOG" >&2
-    exit 1
-  fi
-  sleep 0.25
-done
-
+PUBLIC_ORIGIN="${GHOST_PLUGIN_PUBLIC_ORIGIN:-}"
 if [[ -z "$PUBLIC_ORIGIN" ]]; then
-  echo "ERROR: cloudflared did not provide a public URL" >&2
-  cat "$CF_LOG" >&2
+  : > "$INGRESS_LOG"
+  echo "[ghost-plugin] starting HTTPS ingress over TCP/443"
+  ssh -T -p 443     -o ExitOnForwardFailure=yes     -o ServerAliveInterval=15     -o ServerAliveCountMax=3     -o StrictHostKeyChecking=no     -o UserKnownHostsFile="$TARGET/ghost-plugin-pinggy-known-hosts"     -R0:"$PLUGIN_ADDR":"$PLUGIN_PORT"     a.pinggy.io     >"$INGRESS_LOG" 2>&1 &
+  INGRESS_PID=$!
+
+  for _ in $(seq 1 120); do
+    PUBLIC_ORIGIN="$(grep -Eo 'https://[-a-z0-9.]+\.(free\.pinggy\.net|run\.pinggy-free\.link)' "$INGRESS_LOG" | head -1 || true)"
+    if [[ -n "$PUBLIC_ORIGIN" ]]; then break; fi
+    if ! kill -0 "$INGRESS_PID" 2>/dev/null; then
+      cat "$INGRESS_LOG" >&2
+      exit 1
+    fi
+    sleep 0.25
+  done
+fi
+
+PUBLIC_ORIGIN="${PUBLIC_ORIGIN%/}"
+if [[ -z "$PUBLIC_ORIGIN" ]]; then
+  echo "ERROR: HTTPS ingress did not provide a public URL" >&2
+  cat "$INGRESS_LOG" >&2 || true
   exit 1
 fi
 
@@ -102,7 +106,14 @@ echo
 echo "Ghost Shell plugin is ready."
 echo "MCP URL: $PUBLIC_ORIGIN/mcp"
 echo "OAuth owner password file: $TARGET/.ghost-plugin-password"
+if [[ -n "${INGRESS_PID:-}" ]]; then
+  echo "Development ingress is anonymous Pinggy and may rotate; set GHOST_PLUGIN_PUBLIC_ORIGIN for a stable production reverse proxy."
+fi
 echo "Runtime is independent of Desktop Commander once this supervisor is running."
 echo
 
-wait -n "$PLUGIN_PID" "$CF_PID" "$AGENT_PID"
+if [[ -n "${INGRESS_PID:-}" ]]; then
+  wait -n "$PLUGIN_PID" "$INGRESS_PID" "$AGENT_PID"
+else
+  wait -n "$PLUGIN_PID" "$AGENT_PID"
+fi
