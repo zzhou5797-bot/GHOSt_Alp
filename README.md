@@ -339,15 +339,19 @@ See [LICENSE](LICENSE).
 
 ---
 
-## Ghost MCP shell (experimental)
+## Ghost Shell plugin (experimental)
 
-`ghost-mcp` deliberately exposes one MCP tool: `shell`. A caller sends a command
-and Ghost returns stdout, stderr, and the exit code. File operations, searches,
-process inspection, and similar work are done with normal shell commands rather
-than separate MCP tools.
+Ghost now has a fully independent ChatGPT plugin path with exactly one MCP tool:
+`shell`.
 
-Full gateway mode sends SPA v2 before QUIC, negotiates `ghostmcp/1`, validates
-the numeric DID from mTLS, applies Ghost quota/revocation, and executes the shell
-with the operating-system privileges of the Ghost gateway process.
+The remote path is:
 
-See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for setup and tests.
+`ChatGPT -> HTTPS Streamable MCP -> OAuth 2.1/PKCE -> Ghost QUIC -> shell`
+
+It does not use Desktop Commander at runtime. The standalone plugin server lives
+in `ghost-plugin/`, and `scripts/install-ghost-plugin-service.sh` installs a
+user-level systemd service that keeps the plugin, Ghost agent, and HTTPS ingress
+running.
+
+See [`docs/ghost-mcp.md`](docs/ghost-mcp.md) for connection, OAuth, deployment,
+and test details.
